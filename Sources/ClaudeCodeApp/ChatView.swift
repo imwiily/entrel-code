@@ -1,11 +1,17 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
-private let accent = Color(red: 0.85, green: 0.47, blue: 0.34)
+let accent = Color(red: 0.85, green: 0.47, blue: 0.34)
 
 struct ChatView: View {
     @ObservedObject var session: ChatSession
     @State private var draft = ""
-    @FocusState private var inputFocused: Bool
+    @State private var attachments: [Attachment] = []
+    @State private var composerHeight: CGFloat = 20
+    @State private var focusTrigger = 0
+    @State private var selectedSuggestion = 0
+    @State private var dismissedSuggestionsFor: String?
+    @State private var dropTargeted = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,9 +22,7 @@ struct ChatView: View {
                         ForEach(session.items) { item in
                             ChatRow(item: item, session: session)
                         }
-                        if session.busy {
-                            ProgressView().controlSize(.small).padding(.leading, 4)
-                        }
+                        if session.busy { activityRow }
                         Color.clear.frame(height: 1).id("bottom")
                     }
                     .padding(.horizontal, 24)
@@ -28,12 +32,23 @@ struct ChatView: View {
                 }
                 .onChange(of: session.items.count) { _ in proxy.scrollTo("bottom", anchor: .bottom) }
                 .onChange(of: lastText) { _ in proxy.scrollTo("bottom", anchor: .bottom) }
+                .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
             }
             Divider()
             composer
         }
         .background(Color(nsColor: .textBackgroundColor))
-        .onAppear { inputFocused = true }
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(accent, style: StrokeStyle(lineWidth: 2, dash: [8]))
+                    .background(accent.opacity(0.06))
+                    .overlay(Label("Solte para anexar", systemImage: "paperclip").font(.title3))
+                    .padding(8)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onDrop(of: [.fileURL, .image], isTargeted: $dropTargeted, perform: handleDrop)
     }
 
     private var lastText: Int {
@@ -45,52 +60,305 @@ struct ChatView: View {
         VStack(spacing: 8) {
             Image(systemName: "sparkle").font(.system(size: 32)).foregroundStyle(accent)
             Text("Como posso ajudar neste projeto?").font(.title3)
-            if !session.model.isEmpty {
-                Text(session.model).font(.caption).foregroundStyle(.secondary)
-            }
+            Text("Arraste arquivos ou cole imagens · digite / para ver os comandos")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 80)
     }
 
+    private var activityRow: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text(session.activity.isEmpty ? "Trabalhando…" : session.activity)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.leading, 4)
+    }
+
+    // MARK: Composer
+
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            TextField(session.running ? "Mensagem para o Claude…" : "O Claude Code foi encerrado",
-                      text: $draft, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...10)
-                .focused($inputFocused)
-                .onSubmit(send)
-                .disabled(!session.running)
+        VStack(alignment: .leading, spacing: 8) {
+            if !suggestions.isEmpty { suggestionList }
+            if !attachments.isEmpty { attachmentStrip }
+
+            HStack(alignment: .bottom, spacing: 10) {
+                Button(action: chooseFiles) {
+                    Image(systemName: "paperclip").frame(width: 20, height: 20)
+                }
+                .buttonStyle(.borderless)
+                .help("Anexar arquivos")
+                .padding(.bottom, 9)
+
+                ZStack(alignment: .topLeading) {
+                    if draft.isEmpty {
+                        Text(session.running ? "Mensagem para o Claude…  (Shift+Enter para nova linha)"
+                                             : "O Claude Code foi encerrado")
+                            .foregroundStyle(.tertiary)
+                            .padding(.top, 2)
+                            .allowsHitTesting(false)
+                    }
+                    ComposerTextView(text: $draft, height: $composerHeight, isEnabled: session.running,
+                                     focusTrigger: focusTrigger, onSubmit: send, onKey: handleKey,
+                                     onPaste: handlePaste)
+                        .frame(height: composerHeight)
+                }
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .controlBackgroundColor)))
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.25)))
 
-            if session.busy {
-                Button(action: session.interrupt) {
-                    Image(systemName: "stop.fill").frame(width: 20, height: 20)
+                if session.busy {
+                    Button(action: session.interrupt) {
+                        Image(systemName: "stop.fill").frame(width: 20, height: 20)
+                    }
+                    .help("Interromper (Esc)")
+                    .keyboardShortcut(.escape, modifiers: [])
+                } else {
+                    Button(action: send) {
+                        Image(systemName: "arrow.up").frame(width: 20, height: 20)
+                    }
+                    .disabled(!canSend)
+                    .help("Enviar (Enter)")
                 }
-                .help("Interromper (Esc)")
-                .keyboardShortcut(.escape, modifiers: [])
-            } else {
-                Button(action: send) {
-                    Image(systemName: "arrow.up").frame(width: 20, height: 20)
-                }
-                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !session.running)
-                .help("Enviar (Enter)")
             }
+            .buttonStyle(.borderedProminent)
+            .tint(accent)
+
+            StatusBar(session: session)
         }
-        .buttonStyle(.borderedProminent)
-        .tint(accent)
-        .padding(14)
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
+    }
+
+    private var canSend: Bool {
+        session.running && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
     }
 
     private func send() {
-        guard !session.busy else { return }
-        session.send(draft)
+        guard !session.busy, canSend else { return }
+        session.send(draft, attachments: attachments)
         draft = ""
+        attachments = []
+        dismissedSuggestionsFor = nil
+        focusTrigger += 1
+    }
+
+    // MARK: Slash commands
+
+    private var suggestions: [SlashCommand] {
+        guard draft.hasPrefix("/"), !draft.contains(" "), !draft.contains("\n"),
+              dismissedSuggestionsFor != draft else { return [] }
+        let query = draft.dropFirst().lowercased()
+        let prefix = session.commands.filter { $0.name.lowercased().hasPrefix(query) }
+        let contains = session.commands.filter {
+            !$0.name.lowercased().hasPrefix(query) && $0.name.lowercased().contains(query)
+        }
+        return Array((prefix + contains).prefix(8))
+    }
+
+    private var suggestionList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, command in
+                Button { complete(command) } label: {
+                    HStack(spacing: 10) {
+                        Text("/\(command.name)").font(.system(.body, design: .monospaced)).fontWeight(.medium)
+                        if !command.argumentHint.isEmpty {
+                            Text(command.argumentHint).font(.caption).foregroundStyle(.tertiary)
+                        }
+                        Text(command.description)
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(index == clampedSelection ? accent.opacity(0.15) : Color.clear)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .controlBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.25)))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var clampedSelection: Int { min(selectedSuggestion, max(suggestions.count - 1, 0)) }
+
+    private func complete(_ command: SlashCommand) {
+        draft = "/\(command.name) "
+        selectedSuggestion = 0
+        focusTrigger += 1
+    }
+
+    private func handleKey(_ key: ComposerTextView.Key) -> Bool {
+        let list = suggestions
+        if list.isEmpty {
+            if key == .escape && session.busy { session.interrupt(); return true }
+            return false
+        }
+        switch key {
+        case .up: selectedSuggestion = max(clampedSelection - 1, 0)
+        case .down: selectedSuggestion = min(clampedSelection + 1, list.count - 1)
+        case .tab, .enter:
+            // Enter on a fully typed command sends it instead of completing again.
+            if key == .enter, list[clampedSelection].name == draft.dropFirst() { return false }
+            complete(list[clampedSelection])
+        case .escape: dismissedSuggestionsFor = draft
+        }
+        return true
+    }
+
+    // MARK: Attachments
+
+    private var attachmentStrip: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 8) {
+                ForEach(attachments) { attachment in
+                    HStack(spacing: 6) {
+                        switch attachment.kind {
+                        case .image(let image, _, _):
+                            Image(nsImage: image).resizable().scaledToFill()
+                                .frame(width: 36, height: 36).clipShape(RoundedRectangle(cornerRadius: 6))
+                        case .file:
+                            Image(systemName: "doc").frame(width: 20)
+                        }
+                        Text(attachment.name).font(.caption).lineLimit(1).frame(maxWidth: 160)
+                        Button {
+                            attachments.removeAll { $0.id == attachment.id }
+                        } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(6)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.1)))
+                }
+            }
+        }
+    }
+
+    private func chooseFiles() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.directoryURL = session.directory
+        if panel.runModal() == .OK {
+            attachments += panel.urls.map(Attachment.from(url:))
+        }
+    }
+
+    private func handlePaste(_ pasteboard: NSPasteboard) -> Bool {
+        guard let pasted = Attachment.from(pasteboard: pasteboard) else { return false }
+        attachments += pasted
+        return true
+    }
+
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                    guard let url else { return }
+                    let attachment = Attachment.from(url: url)
+                    DispatchQueue.main.async { attachments.append(attachment) }
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                    guard let data, let attachment = Attachment.image(from: data) else { return }
+                    DispatchQueue.main.async { attachments.append(attachment) }
+                }
+            }
+        }
+        return true
     }
 }
+
+// MARK: - Status bar
+
+private struct StatusBar: View {
+    @ObservedObject var session: ChatSession
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Menu {
+                ForEach(session.models) { model in
+                    Button {
+                        session.setModel(model.value)
+                    } label: {
+                        if model.value == session.selectedModel {
+                            Label("\(model.displayName) — \(model.description)", systemImage: "checkmark")
+                        } else {
+                            Text("\(model.displayName) — \(model.description)")
+                        }
+                    }
+                }
+            } label: {
+                Label(modelName, systemImage: "cpu")
+            }
+            .help("Modelo")
+
+            Menu {
+                ForEach(PermissionModeOption.all) { mode in
+                    Button {
+                        session.setPermissionMode(mode.value)
+                    } label: {
+                        if mode.value == session.permissionMode {
+                            Label(mode.title, systemImage: "checkmark")
+                        } else {
+                            Text(mode.title)
+                        }
+                    }
+                }
+            } label: {
+                Label(currentMode.title, systemImage: currentMode.symbol)
+            }
+            .help("Modo de permissão")
+
+            Spacer()
+
+            if session.contextTokens > 0 {
+                HStack(spacing: 5) {
+                    ProgressView(value: contextFraction)
+                        .progressViewStyle(.linear)
+                        .frame(width: 50)
+                        .tint(contextFraction > 0.8 ? .red : accent)
+                    Text("Contexto \(Int((contextFraction * 100).rounded()))% · \(Self.tokens(session.contextTokens)) / \(Self.tokens(session.contextWindow))")
+                }
+                .help("Quanto da janela de contexto do modelo esta conversa já ocupa")
+            }
+            if session.costUSD > 0 {
+                Text(String(format: "US$ %.2f", session.costUSD))
+                    .help("Custo estimado desta sessão, em preço de API")
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize(horizontal: false, vertical: true)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    private var modelName: String {
+        session.models.first { $0.value == session.selectedModel }?.displayName
+            ?? (session.selectedModel == "default" ? "Modelo padrão" : session.selectedModel)
+    }
+
+    private var currentMode: PermissionModeOption {
+        PermissionModeOption.all.first { $0.value == session.permissionMode }
+            ?? PermissionModeOption(value: session.permissionMode, title: session.permissionMode, symbol: "hand.raised")
+    }
+
+    private var contextFraction: Double {
+        min(Double(session.contextTokens) / Double(max(session.contextWindow, 1)), 1)
+    }
+
+    static func tokens(_ count: Int) -> String {
+        count >= 1000 ? String(format: "%.1f mil", Double(count) / 1000) : "\(count)"
+    }
+}
+
+// MARK: - Rows
 
 private struct ChatRow: View {
     let item: ChatItem
@@ -98,29 +366,41 @@ private struct ChatRow: View {
 
     var body: some View {
         switch item.kind {
-        case .user(let text):
+        case .user(let message):
             HStack {
                 Spacer(minLength: 80)
-                Text(text)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
-                    .background(RoundedRectangle(cornerRadius: 14).fill(accent.opacity(0.15)))
+                VStack(alignment: .trailing, spacing: 6) {
+                    if !message.images.isEmpty {
+                        HStack(spacing: 6) {
+                            ForEach(message.images.indices, id: \.self) { index in
+                                Image(nsImage: message.images[index]).resizable().scaledToFit()
+                                    .frame(maxWidth: 220, maxHeight: 160)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                        }
+                    }
+                    ForEach(message.files, id: \.self) { file in
+                        Label(file, systemImage: "doc").font(.caption)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(Capsule().fill(accent.opacity(0.12)))
+                    }
+                    if !message.text.isEmpty {
+                        Text(message.text)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                            .background(RoundedRectangle(cornerRadius: 14).fill(accent.opacity(0.15)))
+                    }
+                }
             }
         case .assistant(let text):
             if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                HStack {
-                    MarkdownText(text)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 9)
-                        .background(RoundedRectangle(cornerRadius: 14).fill(Color.secondary.opacity(0.12)))
-                    Spacer(minLength: 80)
-                }
+                AssistantBubble(text: text)
             }
-        case .tool(let name, let summary, let result, let isError):
-            ToolRow(name: name, summary: summary, result: result, isError: isError)
-        case .permission(let tool, let summary, let state):
-            PermissionRow(tool: tool, summary: summary, state: state) { allow, always in
+        case .tool(let tool):
+            ToolRow(tool: tool)
+        case .permission(let permission):
+            PermissionRow(permission: permission) { allow, always in
                 session.answerPermission(item.id, allow: allow, always: always)
             }
         case .question(let questions, let answers):
@@ -138,26 +418,66 @@ private struct ChatRow: View {
     }
 }
 
+private struct AssistantBubble: View {
+    let text: String
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 6) {
+            MarkdownText(text)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(RoundedRectangle(cornerRadius: 14).fill(Color.secondary.opacity(0.12)))
+            CopyButton(text: text)
+                .opacity(hovering ? 1 : 0)
+            Spacer(minLength: 60)
+        }
+        .onHover { hovering = $0 }
+    }
+}
+
+struct CopyButton: View {
+    let text: String
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            copied = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+        } label: {
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                .font(.caption)
+                .foregroundStyle(copied ? Color.green : Color.secondary)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(copied ? "Copiado" : "Copiar")
+    }
+}
+
 private struct ToolRow: View {
-    let name: String
-    let summary: String
-    let result: String?
-    let isError: Bool
+    let tool: ChatItem.Tool
     @State private var expanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Button { expanded.toggle() } label: {
                 HStack(spacing: 8) {
                     statusIcon
-                    Text(name).fontWeight(.semibold)
-                    Text(summary)
+                    Text(tool.name).fontWeight(.semibold)
+                    Text(tool.summary)
                         .font(.system(.callout, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
-                    if result != nil {
+                    if case .diff(_, _, let added, let removed) = tool.detail {
+                        DiffStats(added: added, removed: removed)
+                    }
+                    if tool.result != nil {
                         Image(systemName: expanded ? "chevron.up" : "chevron.down")
                             .font(.caption).foregroundStyle(.secondary)
                     }
@@ -166,7 +486,9 @@ private struct ToolRow: View {
             }
             .buttonStyle(.plain)
 
-            if expanded, let result, !result.isEmpty {
+            if let detail = tool.detail { ToolDetailView(detail: detail) }
+
+            if expanded, let result = tool.result, !result.isEmpty {
                 ScrollView {
                     Text(result)
                         .font(.system(.caption, design: .monospaced))
@@ -181,9 +503,9 @@ private struct ToolRow: View {
     }
 
     @ViewBuilder private var statusIcon: some View {
-        if result == nil {
+        if tool.result == nil {
             ProgressView().controlSize(.mini)
-        } else if isError {
+        } else if tool.isError {
             Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
         } else {
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
@@ -191,41 +513,136 @@ private struct ToolRow: View {
     }
 }
 
+private struct DiffStats: View {
+    let added: Int
+    let removed: Int
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text("+\(added)").foregroundStyle(.green)
+            Text("−\(removed)").foregroundStyle(.red)
+        }
+        .font(.system(.caption, design: .monospaced))
+    }
+}
+
+private struct ToolDetailView: View {
+    let detail: ToolDetail
+
+    var body: some View {
+        switch detail {
+        case .markdown(let text):
+            MarkdownText(text)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
+        case .diff(_, let lines, _, _):
+            if lines.isEmpty {
+                Text("Nenhuma alteração").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ScrollView([.vertical, .horizontal]) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(lines.indices, id: \.self) { index in
+                            DiffLineView(line: lines[index])
+                        }
+                    }
+                    .textSelection(.enabled)
+                }
+                .frame(maxHeight: 320)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+        }
+    }
+}
+
+private struct DiffLineView: View {
+    let line: DiffLine
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text(marker)
+                .frame(width: 18)
+                .foregroundStyle(color)
+            Text(line.text.isEmpty ? " " : line.text)
+                .foregroundStyle(line.kind == .gap ? .secondary : .primary)
+                .fixedSize()
+            Spacer(minLength: 0)
+        }
+        .font(.system(.caption, design: .monospaced))
+        .padding(.vertical, 1)
+        .padding(.trailing, 8)
+        .background(background)
+    }
+
+    private var marker: String {
+        switch line.kind {
+        case .added: return "+"
+        case .removed: return "−"
+        case .context, .gap: return ""
+        }
+    }
+
+    private var color: Color {
+        switch line.kind {
+        case .added: return .green
+        case .removed: return .red
+        case .context, .gap: return .secondary
+        }
+    }
+
+    private var background: Color {
+        switch line.kind {
+        case .added: return Color.green.opacity(0.14)
+        case .removed: return Color.red.opacity(0.14)
+        case .context, .gap: return .clear
+        }
+    }
+}
+
 private struct PermissionRow: View {
-    let tool: String
-    let summary: String
-    let state: ChatItem.PermissionState
+    let permission: ChatItem.Permission
     let answer: (_ allow: Bool, _ always: Bool) -> Void
+
+    private var isPlan: Bool { permission.tool == "ExitPlanMode" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("Permitir \(tool)?", systemImage: "hand.raised.fill")
-                .fontWeight(.semibold)
-            if !summary.isEmpty {
-                Text(summary)
+            HStack {
+                Label(isPlan ? "Aprovar o plano e começar?" : "Permitir \(permission.tool)?",
+                      systemImage: isPlan ? "list.bullet.clipboard" : "hand.raised.fill")
+                    .fontWeight(.semibold)
+                Spacer()
+                if case .diff(_, _, let added, let removed) = permission.detail {
+                    DiffStats(added: added, removed: removed)
+                }
+            }
+            if !permission.summary.isEmpty && !isPlan {
+                Text(permission.summary)
                     .font(.system(.callout, design: .monospaced))
                     .textSelection(.enabled)
             }
-            switch state {
+            if let detail = permission.detail { ToolDetailView(detail: detail) }
+            switch permission.state {
             case .pending:
                 HStack {
-                    Button("Permitir") { answer(true, false) }
+                    Button(isPlan ? "Aprovar plano" : "Permitir") { answer(true, false) }
                         .buttonStyle(.borderedProminent).tint(accent)
-                    Button("Sempre permitir") { answer(true, true) }
-                    Button("Negar", role: .destructive) { answer(false, false) }
+                    if !isPlan { Button("Sempre permitir") { answer(true, true) } }
+                    Button(isPlan ? "Continuar planejando" : "Negar", role: .destructive) { answer(false, false) }
                 }
             case .allowed:
-                Text("Permitido").font(.caption).foregroundStyle(.secondary)
+                Text(isPlan ? "Plano aprovado" : "Permitido").font(.caption).foregroundStyle(.secondary)
             case .allowedAlways:
                 Text("Sempre permitido").font(.caption).foregroundStyle(.secondary)
             case .denied:
-                Text("Negado").font(.caption).foregroundStyle(.secondary)
+                Text(isPlan ? "Plano recusado" : "Negado").font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 10).fill(accent.opacity(0.08)))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(accent.opacity(state == .pending ? 0.6 : 0.2)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(accent.opacity(permission.state == .pending ? 0.6 : 0.2)))
     }
 }
 
@@ -247,6 +664,12 @@ private struct AgentRow: View {
                     .font(.caption2.weight(.semibold))
                     .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(Capsule().fill(accent.opacity(0.2)))
+                if agent.background {
+                    Text("segundo plano")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.secondary.opacity(0.2)))
+                }
                 Text(agent.description).foregroundStyle(.secondary).lineLimit(1)
                 Spacer()
                 if !agent.steps.isEmpty {
@@ -275,8 +698,8 @@ private struct AgentRow: View {
                             MarkdownText(text)
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
-                        case .tool(let name, let summary, let result, let isError):
-                            ToolRow(name: name, summary: summary, result: result, isError: isError)
+                        case .tool(let tool):
+                            ToolRow(tool: tool)
                         }
                     }
                 }
@@ -318,6 +741,58 @@ private struct AgentRow: View {
             }
             .buttonStyle(.plain)
             if isOn.wrappedValue { content() }
+        }
+    }
+}
+
+// MARK: - Conversation history
+
+struct HistoryList: View {
+    let directory: URL
+    let currentID: String?
+    let open: (String) -> Void
+    @State private var sessions: [SessionSummary]?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Conversas nesta pasta").font(.headline).padding(12)
+            Divider()
+            if let sessions {
+                if sessions.isEmpty {
+                    Text("Nenhuma conversa salva ainda.")
+                        .foregroundStyle(.secondary).padding(20)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(sessions) { session in
+                                Button { open(session.id) } label: {
+                                    HStack(alignment: .top, spacing: 10) {
+                                        Image(systemName: session.id == currentID ? "bubble.left.fill" : "bubble.left")
+                                            .foregroundStyle(session.id == currentID ? accent : .secondary)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(session.title).lineLimit(2)
+                                            Text(session.date.formatted(.relative(presentation: .named)))
+                                                .font(.caption).foregroundStyle(.secondary)
+                                        }
+                                        Spacer(minLength: 0)
+                                    }
+                                    .padding(.horizontal, 12).padding(.vertical, 8)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                Divider().padding(.leading, 38)
+                            }
+                        }
+                    }
+                }
+            } else {
+                ProgressView().frame(maxWidth: .infinity).padding(20)
+            }
+        }
+        .frame(width: 380, height: 440, alignment: .top)
+        .task {
+            let directory = directory
+            sessions = await Task.detached { Transcripts.list(for: directory) }.value
         }
     }
 }
@@ -579,9 +1054,11 @@ private struct MarkdownText: View {
                 Text(text)
                     .font(.system(.callout, design: .monospaced))
                     .padding(10)
+                    .padding(.trailing, 24)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.1)))
+            .overlay(alignment: .topTrailing) { CopyButton(text: text).padding(4) }
         case .table(let header, let alignments, let rows):
             ScrollView(.horizontal) {
                 Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {

@@ -1,27 +1,49 @@
-import Foundation
+import AppKit
 
 // Talks to `claude -p` over its stream-json protocol: user messages go in on stdin,
 // assistant/tool events and permission requests come back on stdout, one JSON per line.
 
 struct ChatItem: Identifiable {
     enum Kind {
-        case user(String)
+        case user(UserMessage)
         case assistant(String)
-        case tool(name: String, summary: String, result: String?, isError: Bool)
-        case permission(tool: String, summary: String, state: PermissionState)
+        case tool(Tool)
+        case permission(Permission)
         case question([Question], answers: [String: String]?)
         case agent(Agent)
         case notice(String)
     }
 
+    struct UserMessage {
+        var text: String
+        var images: [NSImage] = []
+        var files: [String] = []
+    }
+
+    struct Tool {
+        var name: String
+        var summary: String
+        var detail: ToolDetail?
+        var result: String?
+        var isError = false
+    }
+
+    struct Permission {
+        var tool: String
+        var summary: String
+        var detail: ToolDetail?
+        var state: PermissionState = .pending
+    }
+
     struct Agent {
         enum Step {
             case text(String)
-            case tool(name: String, summary: String, result: String?, isError: Bool)
+            case tool(Tool)
         }
         let type: String
         let description: String
         let prompt: String
+        var background = false
         var steps: [Step] = []
         var progress = ""
         var result: String?
@@ -42,19 +64,64 @@ struct ChatItem: Identifiable {
     var kind: Kind
 }
 
+struct ModelOption: Identifiable {
+    let value: String
+    let displayName: String
+    let description: String
+    var id: String { value }
+}
+
+struct SlashCommand: Identifiable {
+    let name: String
+    let description: String
+    let argumentHint: String
+    var id: String { name }
+}
+
+struct PermissionModeOption: Identifiable {
+    let value: String
+    let title: String
+    let symbol: String
+    var id: String { value }
+
+    static let all = [
+        PermissionModeOption(value: "default", title: "Perguntar sempre", symbol: "hand.raised"),
+        PermissionModeOption(value: "acceptEdits", title: "Aceitar edições", symbol: "pencil.and.outline"),
+        PermissionModeOption(value: "plan", title: "Modo plano", symbol: "list.bullet.clipboard"),
+        PermissionModeOption(value: "auto", title: "Automático", symbol: "bolt"),
+    ]
+}
+
 final class ChatSession: ObservableObject {
     @Published private(set) var items: [ChatItem] = []
     @Published private(set) var busy = false
     @Published private(set) var running = false
-    @Published private(set) var model = ""
-
+    @Published private(set) var activity = ""
     @Published private(set) var directory: URL?
+    @Published private(set) var sessionID: String?
+
+    @Published private(set) var models: [ModelOption] = []
+    @Published private(set) var commands: [SlashCommand] = []
+    @Published private(set) var selectedModel = UserDefaults.standard.string(forKey: "chatModel") ?? "default"
+    @Published private(set) var permissionMode = UserDefaults.standard.string(forKey: "permissionMode") ?? "default"
+    @Published private(set) var resolvedModel = ""
+
+    @Published private(set) var contextTokens = 0
+    @Published private(set) var contextWindow = 200_000
+    @Published private(set) var costUSD = 0.0
+
     private var process: Process?
     private var stdin: FileHandle?
     private var buffer = Data()
+    private var initRequestID = ""
+    private var replaying = false
+    private var turnStarted: Date?
 
     // Index of the assistant text item currently receiving streamed deltas.
     private var streamingIndex: Int?
+    // Messages whose text already arrived as stream deltas.
+    private var streamedMessages: Set<String> = []
+    private var currentMessageID: String?
     private var toolIndex: [String: Int] = [:]
     // Subagent tool_use id -> index of its card. Nested subagents map to the outermost card.
     private var agentIndex: [String: Int] = [:]
@@ -70,26 +137,49 @@ final class ChatSession: ObservableObject {
         restart()
     }
 
+    /// Starts a fresh conversation.
     func restart() {
+        start(resuming: nil)
+    }
+
+    /// Reopens a saved conversation: replays its transcript, then continues it.
+    func resume(_ id: String) {
+        start(resuming: id)
+    }
+
+    private func start(resuming resumeID: String?) {
         guard let directory else { return }
         stop()
         items = []
         streamingIndex = nil
+        streamedMessages = []
         toolIndex = [:]
         agentIndex = [:]
         agentStepIndex = [:]
         permissionIndex = [:]
         pendingPermissions = [:]
         buffer = Data()
+        contextTokens = 0
+        costUSD = 0
+        sessionID = resumeID
+
+        if let resumeID {
+            replay(Transcripts.file(for: resumeID, in: directory))
+        }
 
         let home = NSHomeDirectory()
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "\(home)/.local/bin:\(home)/.claude/local:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         env["LANG"] = env["LANG"] ?? "en_US.UTF-8"
 
+        var command = "exec claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio"
+        command += " --permission-mode \(Self.shellQuote(permissionMode))"
+        if selectedModel != "default" { command += " --model \(Self.shellQuote(selectedModel))" }
+        if let resumeID { command += " --resume \(Self.shellQuote(resumeID))" }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: env["SHELL"] ?? "/bin/zsh")
-        process.arguments = ["-l", "-c", "exec claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio"]
+        process.arguments = ["-l", "-c", command]
         process.currentDirectoryURL = directory
         process.environment = env
 
@@ -113,6 +203,7 @@ final class ChatSession: ObservableObject {
                 guard let self, proc === self.process else { return }
                 self.running = false
                 self.busy = false
+                self.activity = ""
             }
         }
 
@@ -125,7 +216,8 @@ final class ChatSession: ObservableObject {
         self.process = process
         stdin = inPipe.fileHandleForWriting
         running = true
-        write(["type": "control_request", "request_id": UUID().uuidString, "request": ["subtype": "initialize"]])
+        initRequestID = UUID().uuidString
+        write(["type": "control_request", "request_id": initRequestID, "request": ["subtype": "initialize"]])
     }
 
     func stop() {
@@ -134,27 +226,68 @@ final class ChatSession: ObservableObject {
         stdin = nil
         running = false
         busy = false
+        activity = ""
     }
 
     // MARK: Sending
 
-    func send(_ text: String) {
+    func send(_ text: String, attachments: [Attachment] = []) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, running else { return }
-        append(.user(text))
+        guard (!text.isEmpty || !attachments.isEmpty), running else { return }
+
+        var message = ChatItem.UserMessage(text: text)
+        var blocks: [[String: Any]] = []
+        var fileLines: [String] = []
+        for attachment in attachments {
+            switch attachment.kind {
+            case .image(let image, let data, let mediaType):
+                message.images.append(image)
+                blocks.append(["type": "image",
+                               "source": ["type": "base64", "media_type": mediaType,
+                                          "data": data.base64EncodedString()]])
+            case .file(let url):
+                message.files.append(url.lastPathComponent)
+                fileLines.append("Arquivo anexado: \(url.path)")
+            }
+        }
+        let fullText = ([text] + fileLines).filter { !$0.isEmpty }.joined(separator: "\n")
+
+        append(.user(message))
         streamingIndex = nil
         busy = true
-        write(["type": "user", "message": ["role": "user", "content": text]])
+        activity = "Pensando…"
+        turnStarted = Date()
+
+        let content: Any
+        if blocks.isEmpty {
+            content = fullText
+        } else {
+            if !fullText.isEmpty { blocks.append(["type": "text", "text": fullText]) }
+            content = blocks
+        }
+        write(["type": "user", "message": ["role": "user", "content": content]])
     }
 
     func interrupt() {
         guard busy else { return }
-        write(["type": "control_request", "request_id": UUID().uuidString, "request": ["subtype": "interrupt"]])
+        sendControl(["subtype": "interrupt"])
+    }
+
+    func setModel(_ value: String) {
+        selectedModel = value
+        UserDefaults.standard.set(value, forKey: "chatModel")
+        if running { sendControl(["subtype": "set_model", "model": value]) }
+    }
+
+    func setPermissionMode(_ value: String) {
+        permissionMode = value
+        UserDefaults.standard.set(value, forKey: "permissionMode")
+        if running { sendControl(["subtype": "set_permission_mode", "mode": value]) }
     }
 
     func answerPermission(_ itemID: UUID, allow: Bool, always: Bool = false) {
         guard let (requestID, index, request) = takeRequest(for: itemID),
-              case .permission(let tool, let summary, _) = items[index].kind else { return }
+              case .permission(var permission) = items[index].kind else { return }
 
         var response: [String: Any]
         if allow {
@@ -165,8 +298,9 @@ final class ChatSession: ObservableObject {
         } else {
             response = ["behavior": "deny", "message": "O usuário negou esta ação."]
         }
-        items[index].kind = .permission(tool: tool, summary: summary,
-                                        state: allow ? (always ? .allowedAlways : .allowed) : .denied)
+        permission.state = allow ? (always ? .allowedAlways : .allowed) : .denied
+        items[index].kind = .permission(permission)
+        activity = busy ? "Pensando…" : ""
         write(["type": "control_response",
                "response": ["subtype": "success", "request_id": requestID, "response": response]])
     }
@@ -185,6 +319,7 @@ final class ChatSession: ObservableObject {
             response = ["behavior": "deny", "message": "O usuário preferiu não responder."]
         }
         items[index].kind = .question(questions, answers: answers ?? [:])
+        activity = busy ? "Pensando…" : ""
         write(["type": "control_response",
                "response": ["subtype": "success", "request_id": requestID, "response": response]])
     }
@@ -194,6 +329,10 @@ final class ChatSession: ObservableObject {
                 .map({ ($0.key, $0.value) }),
               let request = pendingPermissions.removeValue(forKey: requestID) else { return nil }
         return (requestID, index, request)
+    }
+
+    private func sendControl(_ request: [String: Any]) {
+        write(["type": "control_request", "request_id": UUID().uuidString, "request": request])
     }
 
     private func write(_ object: [String: Any]) {
@@ -214,6 +353,25 @@ final class ChatSession: ObservableObject {
         }
     }
 
+    private func replay(_ file: URL) {
+        guard let data = try? Data(contentsOf: file) else {
+            append(.notice("Não foi possível ler o histórico desta conversa."))
+            return
+        }
+        replaying = true
+        defer { replaying = false }
+        for line in data.split(separator: 0x0A) {
+            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  object["isSidechain"] as? Bool != true, object["isMeta"] as? Bool != true else { continue }
+            handle(object)
+        }
+        // Background work from an earlier run can't report back any more.
+        for (id, _) in agentIndex {
+            updateAgent(id) { if $0.result == nil { $0.result = "" } }
+        }
+        streamingIndex = nil
+    }
+
     private func handle(_ event: [String: Any]) {
         if let parent = event["parent_tool_use_id"] as? String {
             handleSubagent(event, parent: parent)
@@ -222,65 +380,177 @@ final class ChatSession: ObservableObject {
 
         switch event["type"] as? String {
         case "system":
-            switch event["subtype"] as? String {
-            case "init":
-                model = event["model"] as? String ?? ""
-            case "task_progress":
-                if let id = event["tool_use_id"] as? String, let description = event["description"] as? String {
-                    updateAgent(id) { $0.progress = description }
-                }
-            default:
-                break
-            }
+            handleSystem(event)
         case "stream_event":
             handleStream(event["event"] as? [String: Any] ?? [:])
         case "assistant":
-            let content = (event["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
-            for block in content where block["type"] as? String == "tool_use" {
+            handleAssistant(event)
+        case "user":
+            handleUser(event)
+        case "control_request":
+            handleControlRequest(event)
+        case "control_response":
+            handleControlResponse(event["response"] as? [String: Any] ?? [:])
+        case "result":
+            handleResult(event)
+        default:
+            break
+        }
+    }
+
+    private func handleSystem(_ event: [String: Any]) {
+        switch event["subtype"] as? String {
+        case "init":
+            resolvedModel = event["model"] as? String ?? resolvedModel
+            sessionID = event["session_id"] as? String ?? sessionID
+            if let mode = event["permissionMode"] as? String, mode != permissionMode {
+                permissionMode = mode
+            }
+        case "status":
+            if busy, event["status"] as? String == "requesting" { activity = "Pensando…" }
+        case "task_progress":
+            if let id = event["tool_use_id"] as? String, let description = event["description"] as? String {
+                updateAgent(id) { $0.progress = description }
+                if busy { activity = "Subagente: \(description)" }
+            }
+        case "task_notification":
+            guard let id = event["tool_use_id"] as? String else { return }
+            let status = event["status"] as? String ?? "completed"
+            let summary = event["summary"] as? String ?? event["result"] as? String
+            updateAgent(id) {
+                if $0.result == nil || $0.background {
+                    $0.result = summary ?? (status == "completed" ? "Concluído em segundo plano." : "")
+                }
+                $0.isError = status != "completed"
+                $0.progress = ""
+                $0.background = false
+            }
+        case "local_command":
+            // Output of slash commands like /context, as saved in transcripts.
+            if let content = event["content"] as? String {
+                let text = Self.stripCommandTags(content)
+                if !text.isEmpty { append(.assistant(text)) }
+            }
+        default:
+            break
+        }
+    }
+
+    private func handleAssistant(_ event: [String: Any]) {
+        let message = event["message"] as? [String: Any] ?? [:]
+        let content = message["content"] as? [[String: Any]] ?? []
+        let messageID = message["id"] as? String ?? ""
+        let streamed = streamedMessages.contains(messageID)
+
+        if message["model"] as? String != "<synthetic>", let usage = message["usage"] as? [String: Any] {
+            let tokens = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"]
+                .reduce(0) { $0 + (usage[$1] as? Int ?? 0) }
+            if tokens > 0 { contextTokens = tokens }
+        }
+
+        for block in content {
+            switch block["type"] as? String {
+            case "text":
+                // Live text arrives as stream deltas; replayed and local-command text doesn't.
+                guard !streamed, let text = block["text"] as? String else { continue }
+                let cleaned = Self.stripCommandTags(text)
+                if !cleaned.isEmpty { append(.assistant(cleaned)) }
+                streamingIndex = nil
+            case "tool_use":
                 let id = block["id"] as? String ?? UUID().uuidString
                 let name = block["name"] as? String ?? "Ferramenta"
                 // Questions get their own card from the permission request.
                 if name == "AskUserQuestion" { continue }
                 let input = block["input"] as? [String: Any] ?? [:]
-                if Self.isAgentTool(name) {
-                    agentIndex[id] = append(.agent(Self.agent(from: input)))
-                    streamingIndex = nil
-                    continue
-                }
-                toolIndex[id] = append(.tool(name: name, summary: Self.summary(name: name, input: input), result: nil, isError: false))
                 streamingIndex = nil
-            }
-        case "user":
-            let content = (event["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
-            for block in content where block["type"] as? String == "tool_result" {
-                if let id = block["tool_use_id"] as? String, agentIndex[id] != nil {
-                    // Prefer the subagent's own report over the hand-back wrapper text.
-                    let report = (event["tool_use_result"] as? [String: Any])?["content"]
-                    let text = Self.text(of: report).isEmpty ? Self.text(of: block["content"]) : Self.text(of: report)
-                    updateAgent(id) {
-                        $0.result = text
-                        $0.isError = block["is_error"] as? Bool ?? false
-                        $0.progress = ""
-                    }
+                if Self.isAgentTool(name) {
+                    var agent = Self.agent(from: input)
+                    agent.background = input["run_in_background"] as? Bool ?? false
+                    agentIndex[id] = append(.agent(agent))
                     continue
                 }
-                guard let id = block["tool_use_id"] as? String, let index = toolIndex[id],
-                      case .tool(let name, let summary, _, _) = items[index].kind else { continue }
-                items[index].kind = .tool(name: name, summary: summary,
-                                          result: Self.text(of: block["content"]),
-                                          isError: block["is_error"] as? Bool ?? false)
+                if busy { activity = "Executando \(name)…" }
+                toolIndex[id] = append(.tool(.init(
+                    name: name, summary: Self.summary(name: name, input: input),
+                    detail: ToolDetail.make(name: name, input: input, fileMayHaveChanged: replaying))))
+            default:
+                break
             }
-        case "control_request":
-            handleControlRequest(event)
-        case "result":
-            busy = false
-            streamingIndex = nil
-            if event["is_error"] as? Bool == true, let message = event["result"] as? String {
-                append(.notice(message))
-            }
-        default:
-            break
         }
+    }
+
+    private func handleUser(_ event: [String: Any]) {
+        let message = event["message"] as? [String: Any] ?? [:]
+        let toolUseResult = event["tool_use_result"] ?? event["toolUseResult"]
+
+        if let text = message["content"] as? String {
+            // Only transcripts replay user text; live input was already added by send().
+            if replaying, let shown = Self.userText(fromTranscript: text) {
+                append(.user(.init(text: shown)))
+            }
+            return
+        }
+
+        let content = message["content"] as? [[String: Any]] ?? []
+        if replaying {
+            var userMessage = ChatItem.UserMessage(text: "")
+            for block in content {
+                if block["type"] as? String == "text", let text = block["text"] as? String,
+                   let shown = Self.userText(fromTranscript: text) {
+                    userMessage.text += (userMessage.text.isEmpty ? "" : "\n") + shown
+                } else if block["type"] as? String == "image",
+                          let source = block["source"] as? [String: Any],
+                          let base64 = source["data"] as? String,
+                          let data = Data(base64Encoded: base64), let image = NSImage(data: data) {
+                    userMessage.images.append(image)
+                }
+            }
+            if !userMessage.text.isEmpty || !userMessage.images.isEmpty { append(.user(userMessage)) }
+        }
+
+        for block in content where block["type"] as? String == "tool_result" {
+            guard let id = block["tool_use_id"] as? String else { continue }
+            let isError = block["is_error"] as? Bool ?? false
+            if agentIndex[id] != nil {
+                updateAgent(id) { agent in
+                    if agent.background && !self.replaying {
+                        agent.progress = "Rodando em segundo plano…"
+                        return
+                    }
+                    // Prefer the subagent's own report over the hand-back wrapper text.
+                    let report = Self.text(of: (toolUseResult as? [String: Any])?["content"])
+                    agent.result = report.isEmpty ? Self.text(of: block["content"]) : report
+                    agent.isError = isError
+                    agent.progress = ""
+                }
+                continue
+            }
+            guard let index = toolIndex[id], case .tool(var tool) = items[index].kind else { continue }
+            tool.result = Self.text(of: block["content"])
+            tool.isError = isError
+            items[index].kind = .tool(tool)
+        }
+    }
+
+    private func handleResult(_ event: [String: Any]) {
+        busy = false
+        activity = ""
+        streamingIndex = nil
+        if let cost = event["total_cost_usd"] as? Double { costUSD = cost }
+        if let usage = event["modelUsage"] as? [String: [String: Any]],
+           let window = usage.values.compactMap({ $0["contextWindow"] as? Int }).max() {
+            contextWindow = window
+        }
+        if event["is_error"] as? Bool == true, let message = event["result"] as? String {
+            append(.notice(message))
+        }
+        if let started = turnStarted, Date().timeIntervalSince(started) > 10 {
+            let last = items.last { if case .assistant = $0.kind { return true }; return false }
+            var body = "Pronto."
+            if case .assistant(let text) = last?.kind { body = String(text.prefix(140)) }
+            Notifier.notify(title: "Claude terminou", body: body)
+        }
+        turnStarted = nil
     }
 
     private func handleSubagent(_ event: [String: Any], parent: String) {
@@ -302,9 +572,10 @@ final class ChatSession: ObservableObject {
                     let input = block["input"] as? [String: Any] ?? [:]
                     if Self.isAgentTool(name) { agentIndex[id] = index }
                     agentStepIndex[id] = (index, agent.steps.count)
-                    agent.steps.append(.tool(name: Self.isAgentTool(name) ? "Subagente" : name,
-                                             summary: Self.summary(name: name, input: input),
-                                             result: nil, isError: false))
+                    agent.steps.append(.tool(.init(
+                        name: Self.isAgentTool(name) ? "Subagente" : name,
+                        summary: Self.summary(name: name, input: input),
+                        detail: ToolDetail.make(name: name, input: input, fileMayHaveChanged: replaying))))
                 default:
                     break
                 }
@@ -312,10 +583,10 @@ final class ChatSession: ObservableObject {
         case "user":
             for block in content where block["type"] as? String == "tool_result" {
                 guard let id = block["tool_use_id"] as? String, let (owner, step) = agentStepIndex[id],
-                      owner == index, case .tool(let name, let summary, _, _) = agent.steps[step] else { continue }
-                agent.steps[step] = .tool(name: name, summary: summary,
-                                          result: Self.text(of: block["content"]),
-                                          isError: block["is_error"] as? Bool ?? false)
+                      owner == index, case .tool(var tool) = agent.steps[step] else { continue }
+                tool.result = Self.text(of: block["content"])
+                tool.isError = block["is_error"] as? Bool ?? false
+                agent.steps[step] = .tool(tool)
             }
         default:
             return
@@ -331,14 +602,29 @@ final class ChatSession: ObservableObject {
 
     private func handleStream(_ event: [String: Any]) {
         switch event["type"] as? String {
+        case "message_start":
+            currentMessageID = (event["message"] as? [String: Any])?["id"] as? String
         case "content_block_start":
-            if (event["content_block"] as? [String: Any])?["type"] as? String == "text" {
+            let block = event["content_block"] as? [String: Any] ?? [:]
+            switch block["type"] as? String {
+            case "text":
+                if let currentMessageID { streamedMessages.insert(currentMessageID) }
                 streamingIndex = append(.assistant(""))
+                activity = "Escrevendo…"
+            case "thinking":
+                activity = "Pensando…"
+            case "tool_use":
+                activity = "Preparando \(block["name"] as? String ?? "ferramenta")…"
+            default:
+                break
             }
         case "content_block_delta":
             guard let delta = event["delta"] as? [String: Any], delta["type"] as? String == "text_delta",
                   let text = delta["text"] as? String else { return }
-            if streamingIndex == nil { streamingIndex = append(.assistant("")) }
+            if streamingIndex == nil {
+                if let currentMessageID { streamedMessages.insert(currentMessageID) }
+                streamingIndex = append(.assistant(""))
+            }
             if let index = streamingIndex, case .assistant(let current) = items[index].kind {
                 items[index].kind = .assistant(current + text)
             }
@@ -357,18 +643,44 @@ final class ChatSession: ObservableObject {
                    "response": ["subtype": "error", "request_id": requestID, "error": "Não suportado por este app"]])
             return
         }
-        let name = request["display_name"] as? String ?? request["tool_name"] as? String ?? "Ferramenta"
+        let toolName = request["tool_name"] as? String ?? "Ferramenta"
+        let name = request["display_name"] as? String ?? toolName
         let input = request["input"] as? [String: Any] ?? [:]
-        if request["tool_name"] as? String == "AskUserQuestion" {
-            pendingPermissions[requestID] = request
+        pendingPermissions[requestID] = request
+        streamingIndex = nil
+
+        if toolName == "AskUserQuestion" {
             permissionIndex[requestID] = append(.question(Self.questions(from: input), answers: nil))
-            streamingIndex = nil
+            activity = "Aguardando sua resposta"
+            Notifier.notify(title: "Claude tem uma pergunta", body: Self.questions(from: input).first?.question ?? "")
             return
         }
         let summary = request["description"] as? String ?? Self.summary(name: name, input: input)
-        pendingPermissions[requestID] = request
-        permissionIndex[requestID] = append(.permission(tool: name, summary: summary, state: .pending))
-        streamingIndex = nil
+        permissionIndex[requestID] = append(.permission(.init(
+            tool: name, summary: summary, detail: ToolDetail.make(name: toolName, input: input))))
+        activity = "Aguardando sua aprovação"
+        Notifier.notify(title: "Claude precisa da sua aprovação", body: "\(name): \(summary)")
+    }
+
+    private func handleControlResponse(_ response: [String: Any]) {
+        if response["subtype"] as? String == "error" {
+            append(.notice(response["error"] as? String ?? "Erro ao executar o comando."))
+            return
+        }
+        guard response["request_id"] as? String == initRequestID,
+              let payload = response["response"] as? [String: Any] else { return }
+
+        models = (payload["models"] as? [[String: Any]] ?? []).map {
+            ModelOption(value: $0["value"] as? String ?? "",
+                        displayName: $0["displayName"] as? String ?? "",
+                        description: $0["description"] as? String ?? "")
+        }
+        commands = (payload["commands"] as? [[String: Any]] ?? []).compactMap {
+            guard let name = $0["name"] as? String, !name.hasPrefix("_") else { return nil }
+            return SlashCommand(name: name, description: $0["description"] as? String ?? "",
+                                argumentHint: $0["argumentHint"] as? String ?? "")
+        }
+        .sorted { $0.name < $1.name }
     }
 
     @discardableResult
@@ -380,7 +692,7 @@ final class ChatSession: ObservableObject {
     // MARK: Helpers
 
     static func summary(name: String, input: [String: Any]) -> String {
-        for key in ["command", "file_path", "pattern", "url", "query", "description", "prompt"] {
+        for key in ["command", "file_path", "notebook_path", "pattern", "url", "query", "description", "prompt", "skill"] {
             if let value = input[key] as? String, !value.isEmpty {
                 return value.replacingOccurrences(of: NSHomeDirectory(), with: "~")
             }
@@ -414,5 +726,29 @@ final class ChatSession: ObservableObject {
             return blocks.compactMap { $0["text"] as? String }.joined(separator: "\n")
         }
         return ""
+    }
+
+    /// What a transcript's user text looked like when typed, or nil for injected context.
+    static func userText(fromTranscript text: String) -> String? {
+        if let name = text.firstMatch(of: #/<command-name>(.*?)</command-name>/#)?.1 {
+            let args = text.firstMatch(of: #/<command-args>(.*?)</command-args>/#)?.1 ?? ""
+            let command = name.hasPrefix("/") ? String(name) : "/\(name)"
+            return args.isEmpty ? command : "\(command) \(args)"
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed.hasPrefix("<") || trimmed.hasPrefix("[Request interrupted") { return nil }
+        // Drop the "Arquivo anexado:" lines the app adds for attached files.
+        let lines = trimmed.components(separatedBy: "\n").filter { !$0.hasPrefix("Arquivo anexado: ") }
+        let shown = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return shown.isEmpty ? nil : shown
+    }
+
+    static func stripCommandTags(_ text: String) -> String {
+        text.replacing(#/</?local-command-(stdout|stderr)>/#, with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }

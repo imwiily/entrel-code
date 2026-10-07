@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        Notifier.requestAuthorization()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -186,6 +187,7 @@ struct ContentView: View {
     @StateObject private var chat = ChatSession()
     @State private var directory: URL?
     @AppStorage("mode") private var mode: Mode = .chat
+    @State private var showHistory = false
 
     var body: some View {
         Group {
@@ -194,7 +196,7 @@ struct ContentView: View {
             } else if mode == .chat {
                 ChatView(session: chat)
                     .overlay(alignment: .bottom) {
-                        if !chat.running { endedBanner(restart: chat.restart).padding(.bottom, 70) }
+                        if !chat.running { endedBanner(restart: reconnectChat).padding(.bottom, 90) }
                     }
             } else if let view = session.terminalView {
                 TerminalHost(view: view)
@@ -219,6 +221,18 @@ struct ContentView: View {
                     .help("Alternar entre chat e terminal")
                 }
                 ToolbarItemGroup {
+                    if mode == .chat, let directory {
+                        Button { showHistory.toggle() } label: {
+                            Label("Conversas", systemImage: "clock.arrow.circlepath")
+                        }
+                        .help("Retomar uma conversa anterior")
+                        .popover(isPresented: $showHistory, arrowEdge: .bottom) {
+                            HistoryList(directory: directory, currentID: chat.sessionID) { id in
+                                showHistory = false
+                                chat.resume(id)
+                            }
+                        }
+                    }
                     Button(action: chooseFolder) {
                         Label("Abrir pasta", systemImage: "folder")
                     }
@@ -255,6 +269,11 @@ struct ContentView: View {
         case .terminal:
             if session.directory != directory { session.open(directory) }
         }
+    }
+
+    // After the chat process exits, continue the same conversation when there is one.
+    private func reconnectChat() {
+        if let id = chat.sessionID { chat.resume(id) } else { chat.restart() }
     }
 
     private func restartCurrent() {
