@@ -128,17 +128,22 @@ struct AgentStatusPill: View {
     let mode: Mode
 
     var body: some View {
+        // Fixed width: the toolbar sizes its items once, so a pill that grows with
+        // its text would spill out of its own capsule.
         HStack(spacing: 7) {
             StatusBead(color: color, pulsing: chat.busy && mode == .chat, size: 6)
             Text(text)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(Theme.textPrimary)
                 .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, 10).padding(.vertical, 4)
+        .frame(width: 220)
         .background(Capsule().fill(Theme.surface))
         .overlay(Capsule().strokeBorder(Theme.border))
-        .frame(maxWidth: 280)
+        .help(text)
     }
 
     private var text: String {
