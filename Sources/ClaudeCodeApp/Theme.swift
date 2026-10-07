@@ -42,40 +42,28 @@ enum Theme {
     static let removedBackground = hex(0xB8534F, 0.16)
 }
 
-/// The "elo" mark: a spine with two rails and the terracotta link between them.
+/// The ">_" mark: a prompt chevron in warm white and a terracotta cursor.
 struct EntrelMark: View {
-    var spine = Theme.hex(0xE6E6E8)
-    var link = Theme.brand
+    var chevron = Theme.hex(0xE6E6E8)
+    var cursor = Theme.brand
 
     var body: some View {
         Canvas { context, size in
             let scale = min(size.width, size.height) / 100
             context.translateBy(x: (size.width - 100 * scale) / 2, y: (size.height - 100 * scale) / 2)
             context.scaleBy(x: scale, y: scale)
-            let stroke = StrokeStyle(lineWidth: 10, lineCap: .round, lineJoin: .round)
+            let stroke = StrokeStyle(lineWidth: 11, lineCap: .round, lineJoin: .round)
 
-            context.fill(Path(roundedRect: CGRect(x: 20, y: 16, width: 12, height: 68), cornerRadius: 6),
-                         with: .color(spine))
-            var top = Path()
-            top.move(to: CGPoint(x: 26, y: 22))
-            top.addLine(to: CGPoint(x: 68, y: 22))
-            top.addCurve(to: CGPoint(x: 80, y: 34), control1: CGPoint(x: 74.6, y: 22), control2: CGPoint(x: 80, y: 27.4))
-            top.addCurve(to: CGPoint(x: 68, y: 46), control1: CGPoint(x: 80, y: 40.6), control2: CGPoint(x: 74.6, y: 46))
-            top.addLine(to: CGPoint(x: 30, y: 46))
-            context.stroke(top, with: .color(spine), style: stroke)
+            var prompt = Path()
+            prompt.move(to: CGPoint(x: 26, y: 31))
+            prompt.addLine(to: CGPoint(x: 46, y: 50))
+            prompt.addLine(to: CGPoint(x: 26, y: 69))
+            context.stroke(prompt, with: .color(chevron), style: stroke)
 
-            var middle = Path()
-            middle.move(to: CGPoint(x: 26, y: 50))
-            middle.addLine(to: CGPoint(x: 62, y: 50))
-            middle.addCurve(to: CGPoint(x: 74, y: 62), control1: CGPoint(x: 68.6, y: 50), control2: CGPoint(x: 74, y: 55.4))
-            middle.addCurve(to: CGPoint(x: 62, y: 74), control1: CGPoint(x: 74, y: 68.6), control2: CGPoint(x: 68.6, y: 74))
-            middle.addLine(to: CGPoint(x: 30, y: 74))
-            context.stroke(middle, with: .color(link), style: stroke)
-
-            var bottom = Path()
-            bottom.move(to: CGPoint(x: 26, y: 78))
-            bottom.addLine(to: CGPoint(x: 72, y: 78))
-            context.stroke(bottom, with: .color(spine), style: stroke)
+            var underscore = Path()
+            underscore.move(to: CGPoint(x: 56, y: 69))
+            underscore.addLine(to: CGPoint(x: 76, y: 69))
+            context.stroke(underscore, with: .color(cursor), style: stroke)
         }
     }
 }

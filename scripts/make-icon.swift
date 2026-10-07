@@ -1,7 +1,7 @@
 import AppKit
 
-// Renders the 1024x1024 Entrel Code app icon (the "elo" mark on a graphite squircle)
-// to the path given as the first argument. Geometry follows the 240-unit design SVG.
+// Renders the 1024x1024 Entrel Code app icon (the ">_" mark on a graphite squircle)
+// to the path given as the first argument. Drawn in a 240-unit design space.
 let size: CGFloat = 1024
 let inset: CGFloat = 100
 let scale = (size - inset * 2) / 240
@@ -26,40 +26,21 @@ let image = NSImage(size: NSSize(width: size, height: size), flipped: true) { _ 
     color(0x161618).withAlphaComponent(0.5).setFill()
     NSBezierPath(roundedRect: NSRect(x: 4, y: 4, width: 232, height: 232), xRadius: 50, yRadius: 50).fill()
 
-    context.translateBy(x: 56, y: 46)
     let light = color(0xE6E6E8), brand = color(0xD97745)
-
-    light.setFill()
-    NSBezierPath(roundedRect: NSRect(x: 14, y: 14, width: 16, height: 120), xRadius: 8, yRadius: 8).fill()
-
-    func stroke(_ build: (NSBezierPath) -> Void, _ color: NSColor) {
+    func stroke(_ points: [NSPoint], _ color: NSColor) {
         let path = NSBezierPath()
-        build(path)
-        path.lineWidth = 16
+        path.move(to: points[0])
+        points.dropFirst().forEach { path.line(to: $0) }
+        path.lineWidth = 24
         path.lineCapStyle = .round
         path.lineJoinStyle = .round
         color.setStroke()
         path.stroke()
     }
-    stroke({ p in  // top rail
-        p.move(to: NSPoint(x: 22, y: 22)); p.line(to: NSPoint(x: 86, y: 22))
-        p.curve(to: NSPoint(x: 102, y: 38), controlPoint1: NSPoint(x: 94.84, y: 22), controlPoint2: NSPoint(x: 102, y: 29.16))
-        p.curve(to: NSPoint(x: 86, y: 54), controlPoint1: NSPoint(x: 102, y: 46.84), controlPoint2: NSPoint(x: 94.84, y: 54))
-        p.line(to: NSPoint(x: 30, y: 54))
-    }, light)
-    stroke({ p in  // terracotta link
-        p.move(to: NSPoint(x: 22, y: 74)); p.line(to: NSPoint(x: 78, y: 74))
-        p.curve(to: NSPoint(x: 94, y: 90), controlPoint1: NSPoint(x: 86.84, y: 74), controlPoint2: NSPoint(x: 94, y: 81.16))
-        p.curve(to: NSPoint(x: 78, y: 106), controlPoint1: NSPoint(x: 94, y: 98.84), controlPoint2: NSPoint(x: 86.84, y: 106))
-        p.line(to: NSPoint(x: 30, y: 106))
-    }, brand)
-    stroke({ p in  // bottom rail
-        p.move(to: NSPoint(x: 22, y: 126)); p.line(to: NSPoint(x: 86, y: 126))
-        p.curve(to: NSPoint(x: 102, y: 110), controlPoint1: NSPoint(x: 94.84, y: 126), controlPoint2: NSPoint(x: 102, y: 118.84))
-    }, light)
-    stroke({ p in
-        p.move(to: NSPoint(x: 22, y: 126)); p.line(to: NSPoint(x: 92, y: 126))
-    }, light)
+    // The 100-unit mark from the app, scaled to the icon and centered.
+    func p(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: 120 + (x - 51) * 2.2, y: 120 + (y - 50) * 2.2) }
+    stroke([p(26, 31), p(46, 50), p(26, 69)], light)
+    stroke([p(56, 69), p(76, 69)], brand)
     return true
 }
 
