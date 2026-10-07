@@ -642,8 +642,13 @@ final class ChatSession: ObservableObject {
 
     #if DEBUG
     /// Feeds protocol events as if replayed from a transcript, for offscreen render tests.
-    func injectForTesting(_ events: [[String: Any]], directory: URL? = nil) {
+    func injectForTesting(_ events: [[String: Any]], directory: URL? = nil, activity: String? = nil) {
         if let directory { self.directory = directory }
+        if let activity {
+            running = true
+            busy = true
+            self.activity = activity
+        }
         replaying = true
         for event in events { handle(event) }
         replaying = false
