@@ -10,6 +10,7 @@ struct ComposerTextView: NSViewRepresentable {
     @Binding var text: String
     @Binding var height: CGFloat
     var isEnabled: Bool
+    var fontSize: CGFloat = 14
     var focusTrigger: Int
     var onSubmit: () -> Void
     var onKey: (Key) -> Bool
@@ -23,7 +24,7 @@ struct ComposerTextView: NSViewRepresentable {
         textView.onPaste = { context.coordinator.parent.onPaste($0) }
         textView.isRichText = false
         textView.allowsUndo = true
-        textView.font = .systemFont(ofSize: NSFont.systemFontSize + 1)
+        textView.font = .systemFont(ofSize: fontSize)
         textView.drawsBackground = false
         textView.textContainerInset = NSSize(width: 0, height: 2)
         textView.isAutomaticQuoteSubstitutionEnabled = false
@@ -49,6 +50,10 @@ struct ComposerTextView: NSViewRepresentable {
         context.coordinator.parent = self
         guard let textView = scrollView.documentView as? NSTextView else { return }
         textView.isEditable = isEnabled
+        if textView.font?.pointSize != fontSize {
+            textView.font = .systemFont(ofSize: fontSize)
+            context.coordinator.updateHeight(textView)
+        }
         if textView.string != text {
             textView.string = text
             textView.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))

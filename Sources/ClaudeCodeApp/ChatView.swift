@@ -3,8 +3,58 @@ import UniformTypeIdentifiers
 
 let accent = Color(red: 0.85, green: 0.47, blue: 0.34)
 
+// MARK: - Environment
+
+private struct FontScaleKey: EnvironmentKey { static let defaultValue = 1.0 }
+private struct ProjectDirectoryKey: EnvironmentKey { static let defaultValue: URL? = nil }
+
+extension EnvironmentValues {
+    var fontScale: Double {
+        get { self[FontScaleKey.self] }
+        set { self[FontScaleKey.self] = newValue }
+    }
+    var projectDirectory: URL? {
+        get { self[ProjectDirectoryKey.self] }
+        set { self[ProjectDirectoryKey.self] = newValue }
+    }
+}
+
+/// Text styles sized from the app's font scale (⌘+ / ⌘−) instead of fixed system sizes.
+private struct ScaledFont: ViewModifier {
+    @Environment(\.fontScale) private var scale
+    let style: Font.TextStyle
+    let weight: Font.Weight?
+    let design: Font.Design
+
+    func body(content: Content) -> some View {
+        let size: CGFloat
+        var defaultWeight: Font.Weight = .regular
+        switch style {
+        case .largeTitle: size = 26
+        case .title: size = 22
+        case .title2: size = 17
+        case .title3: size = 15
+        case .headline: size = 13; defaultWeight = .semibold
+        case .subheadline: size = 11
+        case .callout: size = 12
+        case .footnote, .caption, .caption2: size = 10
+        default: size = 13
+        }
+        return content.font(.system(size: size * scale, weight: weight ?? defaultWeight, design: design))
+    }
+}
+
+extension View {
+    func scaledFont(_ style: Font.TextStyle, weight: Font.Weight? = nil, design: Font.Design = .default) -> some View {
+        modifier(ScaledFont(style: style, weight: weight, design: design))
+    }
+}
+
+// MARK: - Chat
+
 struct ChatView: View {
     @ObservedObject var session: ChatSession
+    @Binding var findVisible: Bool
     @State private var draft = ""
     @State private var attachments: [Attachment] = []
     @State private var composerHeight: CGFloat = 20
@@ -12,15 +62,33 @@ struct ChatView: View {
     @State private var selectedSuggestion = 0
     @State private var dismissedSuggestionsFor: String?
     @State private var dropTargeted = false
+    @State private var findQuery = ""
+    @State private var findIndex = 0
+    @FocusState private var findFocused: Bool
+    @AppStorage("fontScale") private var fontScale = 1.0
 
     var body: some View {
         VStack(spacing: 0) {
+            if findVisible {
+                findBar
+                Divider()
+            }
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
-                        if session.items.isEmpty { emptyState }
+                        if session.loadingHistory {
+                            HStack { ProgressView().controlSize(.small); Text("Carregando conversa…") }
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity)
+                                .padding(.top, 80)
+                        } else if session.items.isEmpty {
+                            emptyState
+                        }
                         ForEach(session.items) { item in
-                            ChatRow(item: item, session: session)
+                            ChatRow(item: item, revision: item.revision,
+                                    highlighted: item.id == currentMatch, session: session)
+                                .equatable()
+                                .id(item.id)
                         }
                         if session.busy { activityRow }
                         Color.clear.frame(height: 1).id("bottom")
@@ -30,25 +98,44 @@ struct ChatView: View {
                     .frame(maxWidth: 820)
                     .frame(maxWidth: .infinity)
                 }
-                .onChange(of: session.items.count) { _ in proxy.scrollTo("bottom", anchor: .bottom) }
-                .onChange(of: lastText) { _ in proxy.scrollTo("bottom", anchor: .bottom) }
+                .onChange(of: session.items.count) { _ in
+                    if !findVisible { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                .onChange(of: lastText) { _ in
+                    if !findVisible { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                .onChange(of: session.loadingHistory) { _ in proxy.scrollTo("bottom", anchor: .bottom) }
+                .onChange(of: currentMatch) { id in
+                    if let id { withAnimation { proxy.scrollTo(id, anchor: .center) } }
+                }
                 .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
             }
             Divider()
             composer
         }
+        .scaledFont(.body)
+        .environment(\.fontScale, fontScale)
+        .environment(\.projectDirectory, session.directory)
+        .environment(\.openURL, OpenURLAction { url in
+            guard url.isFileURL else { return .systemAction }
+            NSWorkspace.shared.open(url)
+            return .handled
+        })
         .background(Color(nsColor: .textBackgroundColor))
         .overlay {
             if dropTargeted {
                 RoundedRectangle(cornerRadius: 12)
                     .stroke(accent, style: StrokeStyle(lineWidth: 2, dash: [8]))
                     .background(accent.opacity(0.06))
-                    .overlay(Label("Solte para anexar", systemImage: "paperclip").font(.title3))
+                    .overlay(Label("Solte para anexar", systemImage: "paperclip").scaledFont(.title3))
                     .padding(8)
                     .allowsHitTesting(false)
             }
         }
         .onDrop(of: [.fileURL, .image], isTargeted: $dropTargeted, perform: handleDrop)
+        .onChange(of: findVisible) { visible in
+            if visible { findFocused = true } else { findQuery = ""; focusTrigger += 1 }
+        }
     }
 
     private var lastText: Int {
@@ -58,10 +145,10 @@ struct ChatView: View {
 
     private var emptyState: some View {
         VStack(spacing: 8) {
-            Image(systemName: "sparkle").font(.system(size: 32)).foregroundStyle(accent)
-            Text("Como posso ajudar neste projeto?").font(.title3)
-            Text("Arraste arquivos ou cole imagens · digite / para ver os comandos")
-                .font(.caption).foregroundStyle(.secondary)
+            Image(systemName: "sparkle").font(.system(size: 32 * fontScale)).foregroundStyle(accent)
+            Text("Como posso ajudar neste projeto?").scaledFont(.title3)
+            Text("Arraste arquivos ou cole imagens · / para comandos · @ para mencionar arquivos")
+                .scaledFont(.caption).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 80)
@@ -71,11 +158,56 @@ struct ChatView: View {
         HStack(spacing: 8) {
             ProgressView().controlSize(.small)
             Text(session.activity.isEmpty ? "Trabalhando…" : session.activity)
-                .font(.callout)
+                .scaledFont(.callout)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
         .padding(.leading, 4)
+    }
+
+    // MARK: Find
+
+    private var matches: [UUID] {
+        let query = findQuery.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return [] }
+        return session.items.filter { $0.searchText.localizedCaseInsensitiveContains(query) }.map(\.id)
+    }
+
+    private var currentMatch: UUID? {
+        let list = matches
+        guard findVisible, !list.isEmpty else { return nil }
+        return list[min(findIndex, list.count - 1)]
+    }
+
+    private var findBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("Buscar na conversa", text: $findQuery)
+                .textFieldStyle(.plain)
+                .focused($findFocused)
+                .onSubmit { moveMatch(by: NSApp.currentEvent?.modifierFlags.contains(.shift) == true ? -1 : 1) }
+                .onExitCommand { findVisible = false }
+                .onChange(of: findQuery) { _ in findIndex = 0 }
+            if !findQuery.isEmpty {
+                Text(matches.isEmpty ? "Nenhum resultado" : "\(min(findIndex, matches.count - 1) + 1) de \(matches.count)")
+                    .scaledFont(.caption).foregroundStyle(.secondary)
+            }
+            Button { moveMatch(by: -1) } label: { Image(systemName: "chevron.up") }
+                .disabled(matches.isEmpty).help("Anterior (⇧Enter)")
+            Button { moveMatch(by: 1) } label: { Image(systemName: "chevron.down") }
+                .disabled(matches.isEmpty).help("Próximo (Enter)")
+            Button { findVisible = false } label: { Image(systemName: "xmark") }
+                .help("Fechar (Esc)")
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    private func moveMatch(by step: Int) {
+        let count = matches.count
+        guard count > 0 else { return }
+        findIndex = (min(findIndex, count - 1) + step + count) % count
     }
 
     // MARK: Composer
@@ -95,15 +227,14 @@ struct ChatView: View {
 
                 ZStack(alignment: .topLeading) {
                     if draft.isEmpty {
-                        Text(session.running ? "Mensagem para o Claude…  (Shift+Enter para nova linha)"
-                                             : "O Claude Code foi encerrado")
+                        Text(placeholder)
                             .foregroundStyle(.tertiary)
                             .padding(.top, 2)
                             .allowsHitTesting(false)
                     }
                     ComposerTextView(text: $draft, height: $composerHeight, isEnabled: session.running,
-                                     focusTrigger: focusTrigger, onSubmit: send, onKey: handleKey,
-                                     onPaste: handlePaste)
+                                     fontSize: 14 * fontScale, focusTrigger: focusTrigger,
+                                     onSubmit: send, onKey: handleKey, onPaste: handlePaste)
                         .frame(height: composerHeight)
                 }
                 .padding(10)
@@ -116,13 +247,14 @@ struct ChatView: View {
                     }
                     .help("Interromper (Esc)")
                     .keyboardShortcut(.escape, modifiers: [])
-                } else {
-                    Button(action: send) {
-                        Image(systemName: "arrow.up").frame(width: 20, height: 20)
-                    }
-                    .disabled(!canSend)
-                    .help("Enviar (Enter)")
+                    .tint(.secondary)
                 }
+                Button(action: send) {
+                    Image(systemName: "arrow.up").frame(width: 20, height: 20)
+                }
+                .disabled(!canSend)
+                .help(session.busy ? "Enviar agora — o Claude considera a mensagem no meio da tarefa (Enter)"
+                                   : "Enviar (Enter)")
             }
             .buttonStyle(.borderedProminent)
             .tint(accent)
@@ -134,12 +266,19 @@ struct ChatView: View {
         .padding(.bottom, 8)
     }
 
+    private var placeholder: String {
+        if !session.running { return "O Claude Code foi encerrado" }
+        if session.busy { return "Escreva para orientar o Claude enquanto ele trabalha…" }
+        return "Mensagem para o Claude…  (Shift+Enter para nova linha)"
+    }
+
     private var canSend: Bool {
-        session.running && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
+        session.running && !session.loadingHistory
+            && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
     }
 
     private func send() {
-        guard !session.busy, canSend else { return }
+        guard canSend else { return }
         session.send(draft, attachments: attachments)
         draft = ""
         attachments = []
@@ -147,42 +286,53 @@ struct ChatView: View {
         focusTrigger += 1
     }
 
-    // MARK: Slash commands
+    // MARK: Suggestions (/commands and @files)
 
-    private var suggestions: [SlashCommand] {
-        guard draft.hasPrefix("/"), !draft.contains(" "), !draft.contains("\n"),
-              dismissedSuggestionsFor != draft else { return [] }
+    private enum Suggestion: Identifiable {
+        case command(SlashCommand)
+        case file(String)
+        var id: String {
+            switch self {
+            case .command(let command): return "/" + command.name
+            case .file(let path): return "@" + path
+            }
+        }
+    }
+
+    /// The "@partial" being typed at the end of the draft, if any.
+    private var mentionQuery: String? {
+        guard let match = draft.firstMatch(of: #/(?:^|\s)@([^\s]*)$/#) else { return nil }
+        return String(match.1)
+    }
+
+    private var suggestions: [Suggestion] {
+        guard dismissedSuggestionsFor != draft else { return [] }
+        if let query = mentionQuery?.lowercased() {
+            let files = session.projectFiles
+            let named = files.filter { ($0 as NSString).lastPathComponent.lowercased().hasPrefix(query) }
+            let rest = query.isEmpty ? [] : files.filter {
+                $0.lowercased().contains(query) && !($0 as NSString).lastPathComponent.lowercased().hasPrefix(query)
+            }
+            return (named.sorted { $0.count < $1.count } + rest.sorted { $0.count < $1.count })
+                .prefix(8).map(Suggestion.file)
+        }
+        guard draft.hasPrefix("/"), !draft.contains(" "), !draft.contains("\n") else { return [] }
         let query = draft.dropFirst().lowercased()
         let prefix = session.commands.filter { $0.name.lowercased().hasPrefix(query) }
         let contains = session.commands.filter {
             !$0.name.lowercased().hasPrefix(query) && $0.name.lowercased().contains(query)
         }
-        return Array((prefix + contains).prefix(8))
+        return (prefix + contains).prefix(8).map(Suggestion.command)
     }
 
     private var suggestionList: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, command in
-                Button { complete(command) } label: {
-                    HStack(spacing: 10) {
-                        Text("/\(command.name)").font(.system(.body, design: .monospaced)).fontWeight(.medium)
-                        if !command.argumentHint.isEmpty {
-                            Text(command.argumentHint).font(.caption).foregroundStyle(.tertiary)
-                        }
-                        if command.opensTerminal {
-                            Label("terminal", systemImage: "terminal")
-                                .font(.caption2)
-                                .padding(.horizontal, 5).padding(.vertical, 1)
-                                .background(Capsule().fill(Color.secondary.opacity(0.15)))
-                                .help("Abre numa janela de terminal por cima do chat")
-                        }
-                        Text(command.description)
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(index == clampedSelection ? accent.opacity(0.15) : Color.clear)
-                    .contentShape(Rectangle())
+            ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, suggestion in
+                Button { complete(suggestion) } label: {
+                    suggestionLabel(suggestion)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(index == clampedSelection ? accent.opacity(0.15) : Color.clear)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
@@ -192,10 +342,47 @@ struct ChatView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
+    @ViewBuilder private func suggestionLabel(_ suggestion: Suggestion) -> some View {
+        switch suggestion {
+        case .command(let command):
+            HStack(spacing: 10) {
+                Text("/\(command.name)").scaledFont(.body, weight: .medium, design: .monospaced)
+                if !command.argumentHint.isEmpty {
+                    Text(command.argumentHint).scaledFont(.caption).foregroundStyle(.tertiary)
+                }
+                if command.opensTerminal {
+                    Label("terminal", systemImage: "terminal")
+                        .scaledFont(.caption2)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                        .help("Abre numa janela de terminal por cima do chat")
+                }
+                Text(command.description)
+                    .scaledFont(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Spacer(minLength: 0)
+            }
+        case .file(let path):
+            HStack(spacing: 8) {
+                Image(systemName: "doc").foregroundStyle(.secondary)
+                Text((path as NSString).lastPathComponent).fontWeight(.medium)
+                Text((path as NSString).deletingLastPathComponent)
+                    .scaledFont(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
     private var clampedSelection: Int { min(selectedSuggestion, max(suggestions.count - 1, 0)) }
 
-    private func complete(_ command: SlashCommand) {
-        draft = "/\(command.name) "
+    private func complete(_ suggestion: Suggestion) {
+        switch suggestion {
+        case .command(let command):
+            draft = "/\(command.name) "
+        case .file(let path):
+            if let query = mentionQuery {
+                draft = String(draft.dropLast(query.count + 1)) + "@\(path) "
+            }
+        }
         selectedSuggestion = 0
         focusTrigger += 1
     }
@@ -211,7 +398,8 @@ struct ChatView: View {
         case .down: selectedSuggestion = min(clampedSelection + 1, list.count - 1)
         case .tab, .enter:
             // Enter on a fully typed command sends it instead of completing again.
-            if key == .enter, list[clampedSelection].name == draft.dropFirst() { return false }
+            if key == .enter, case .command(let command) = list[clampedSelection],
+               command.name == draft.dropFirst() { return false }
             complete(list[clampedSelection])
         case .escape: dismissedSuggestionsFor = draft
         }
@@ -232,7 +420,7 @@ struct ChatView: View {
                         case .file:
                             Image(systemName: "doc").frame(width: 20)
                         }
-                        Text(attachment.name).font(.caption).lineLimit(1).frame(maxWidth: 160)
+                        Text(attachment.name).scaledFont(.caption).lineLimit(1).frame(maxWidth: 160)
                         Button {
                             attachments.removeAll { $0.id == attachment.id }
                         } label: {
@@ -342,7 +530,7 @@ private struct StatusBar: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize(horizontal: false, vertical: true)
-        .font(.caption)
+        .scaledFont(.caption)
         .foregroundStyle(.secondary)
     }
 
@@ -367,39 +555,32 @@ private struct StatusBar: View {
 
 // MARK: - Rows
 
-private struct ChatRow: View {
+/// Equatable on the item's id and revision, so unchanged rows aren't re-rendered
+/// every time a new message streams in.
+private struct ChatRow: View, Equatable {
     let item: ChatItem
+    let revision: Int
+    let highlighted: Bool
     let session: ChatSession
 
+    static func == (lhs: ChatRow, rhs: ChatRow) -> Bool {
+        lhs.item.id == rhs.item.id && lhs.revision == rhs.revision && lhs.highlighted == rhs.highlighted
+    }
+
     var body: some View {
-        switch item.kind {
-        case .user(let message):
-            HStack {
-                Spacer(minLength: 80)
-                VStack(alignment: .trailing, spacing: 6) {
-                    if !message.images.isEmpty {
-                        HStack(spacing: 6) {
-                            ForEach(message.images.indices, id: \.self) { index in
-                                Image(nsImage: message.images[index]).resizable().scaledToFit()
-                                    .frame(maxWidth: 220, maxHeight: 160)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                            }
-                        }
-                    }
-                    ForEach(message.files, id: \.self) { file in
-                        Label(file, systemImage: "doc").font(.caption)
-                            .padding(.horizontal, 8).padding(.vertical, 4)
-                            .background(Capsule().fill(accent.opacity(0.12)))
-                    }
-                    if !message.text.isEmpty {
-                        Text(message.text)
-                            .textSelection(.enabled)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 9)
-                            .background(RoundedRectangle(cornerRadius: 14).fill(accent.opacity(0.15)))
-                    }
+        content
+            .padding(highlighted ? 4 : 0)
+            .overlay {
+                if highlighted {
+                    RoundedRectangle(cornerRadius: 12).stroke(Color.yellow, lineWidth: 2)
                 }
             }
+    }
+
+    @ViewBuilder private var content: some View {
+        switch item.kind {
+        case .user(let message):
+            UserBubble(message: message, session: session) { session.edit(item.id, newText: $0) }
         case .assistant(let text):
             if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 AssistantBubble(text: text)
@@ -430,9 +611,89 @@ private struct ChatRow: View {
             .background(RoundedRectangle(cornerRadius: 10).fill(accent.opacity(0.08)))
         case .notice(let text):
             Label(text, systemImage: "exclamationmark.triangle")
-                .font(.callout)
+                .scaledFont(.callout)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
+        }
+    }
+}
+
+private struct UserBubble: View {
+    let message: ChatItem.UserMessage
+    @ObservedObject var session: ChatSession
+    let resend: (String) -> Void
+    @State private var hovering = false
+    @State private var editing = false
+    @State private var editedText = ""
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 6) {
+            Spacer(minLength: 80)
+            if !editing && hovering && !message.local && !message.queued && !session.busy && session.running {
+                Button {
+                    editedText = message.text
+                    editing = true
+                } label: {
+                    Image(systemName: "pencil").scaledFont(.caption).foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Editar e reenviar a partir daqui")
+            }
+            VStack(alignment: .trailing, spacing: 6) {
+                if !message.images.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(message.images.indices, id: \.self) { index in
+                            Image(nsImage: message.images[index]).resizable().scaledToFit()
+                                .frame(maxWidth: 220, maxHeight: 160)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                        }
+                    }
+                }
+                ForEach(message.files, id: \.self) { file in
+                    Label(file, systemImage: "doc").scaledFont(.caption)
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(Capsule().fill(accent.opacity(0.12)))
+                }
+                if editing {
+                    editor
+                } else if !message.text.isEmpty {
+                    Text(message.text)
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                        .background(RoundedRectangle(cornerRadius: 14).fill(accent.opacity(0.15)))
+                }
+                if message.queued {
+                    Label("enviada durante a tarefa", systemImage: "clock")
+                        .scaledFont(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .onHover { hovering = $0 }
+    }
+
+    private var editor: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            TextEditor(text: $editedText)
+                .scrollContentBackground(.hidden)
+                .frame(minWidth: 320, minHeight: 60, maxHeight: 200)
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .controlBackgroundColor)))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(accent.opacity(0.6)))
+            Text("A conversa continua a partir daqui, numa cópia. Alterações já feitas em arquivos não são desfeitas.")
+                .scaledFont(.caption2).foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+                .frame(maxWidth: 360, alignment: .trailing)
+            HStack {
+                Button("Cancelar") { editing = false }
+                Button("Reenviar") {
+                    editing = false
+                    resend(editedText)
+                }
+                .buttonStyle(.borderedProminent).tint(accent)
+                .disabled(editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
         }
     }
 }
@@ -456,7 +717,7 @@ private struct ChoiceRow: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(option.label)
                                 if !option.detail.isEmpty {
-                                    Text(option.detail).font(.caption).foregroundStyle(.secondary)
+                                    Text(option.detail).scaledFont(.caption).foregroundStyle(.secondary)
                                 }
                             }
                             Spacer(minLength: 0)
@@ -506,7 +767,7 @@ struct CopyButton: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
         } label: {
             Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(copied ? Color.green : Color.secondary)
                 .frame(width: 22, height: 22)
                 .contentShape(Rectangle())
@@ -527,7 +788,7 @@ private struct ToolRow: View {
                     statusIcon
                     Text(tool.name).fontWeight(.semibold)
                     Text(tool.summary)
-                        .font(.system(.callout, design: .monospaced))
+                        .scaledFont(.callout, design: .monospaced)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -535,9 +796,16 @@ private struct ToolRow: View {
                     if case .diff(_, _, let added, let removed) = tool.detail {
                         DiffStats(added: added, removed: removed)
                     }
+                    if let path = tool.filePath, FileManager.default.fileExists(atPath: path) {
+                        Button { NSWorkspace.shared.open(URL(fileURLWithPath: path)) } label: {
+                            Image(systemName: "arrow.up.forward.square").foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Abrir arquivo")
+                    }
                     if tool.result != nil {
                         Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .scaledFont(.caption).foregroundStyle(.secondary)
                     }
                 }
                 .contentShape(Rectangle())
@@ -549,7 +817,7 @@ private struct ToolRow: View {
             if expanded, let result = tool.result, !result.isEmpty {
                 ScrollView {
                     Text(result)
-                        .font(.system(.caption, design: .monospaced))
+                        .scaledFont(.caption, design: .monospaced)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -558,6 +826,24 @@ private struct ToolRow: View {
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+        .contextMenu {
+            if let path = tool.filePath {
+                Button("Abrir arquivo") { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
+                Button("Mostrar no Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                }
+                Button("Copiar caminho") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(path, forType: .string)
+                }
+            }
+            if let result = tool.result, !result.isEmpty {
+                Button("Copiar saída") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(result, forType: .string)
+                }
+            }
+        }
     }
 
     @ViewBuilder private var statusIcon: some View {
@@ -580,7 +866,7 @@ private struct DiffStats: View {
             Text("+\(added)").foregroundStyle(.green)
             Text("−\(removed)").foregroundStyle(.red)
         }
-        .font(.system(.caption, design: .monospaced))
+        .scaledFont(.caption, design: .monospaced)
     }
 }
 
@@ -596,7 +882,7 @@ private struct ToolDetailView: View {
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
         case .diff(_, let lines, _, _):
             if lines.isEmpty {
-                Text("Nenhuma alteração").font(.caption).foregroundStyle(.secondary)
+                Text("Nenhuma alteração").scaledFont(.caption).foregroundStyle(.secondary)
             } else {
                 ScrollView([.vertical, .horizontal]) {
                     VStack(alignment: .leading, spacing: 0) {
@@ -627,7 +913,7 @@ private struct DiffLineView: View {
                 .fixedSize()
             Spacer(minLength: 0)
         }
-        .font(.system(.caption, design: .monospaced))
+        .scaledFont(.caption, design: .monospaced)
         .padding(.vertical, 1)
         .padding(.trailing, 8)
         .background(background)
@@ -677,7 +963,7 @@ private struct PermissionRow: View {
             }
             if !permission.summary.isEmpty && !isPlan {
                 Text(permission.summary)
-                    .font(.system(.callout, design: .monospaced))
+                    .scaledFont(.callout, design: .monospaced)
                     .textSelection(.enabled)
             }
             if let detail = permission.detail { ToolDetailView(detail: detail) }
@@ -690,11 +976,11 @@ private struct PermissionRow: View {
                     Button(isPlan ? "Continuar planejando" : "Negar", role: .destructive) { answer(false, false) }
                 }
             case .allowed:
-                Text(isPlan ? "Plano aprovado" : "Permitido").font(.caption).foregroundStyle(.secondary)
+                Text(isPlan ? "Plano aprovado" : "Permitido").scaledFont(.caption).foregroundStyle(.secondary)
             case .allowedAlways:
-                Text("Sempre permitido").font(.caption).foregroundStyle(.secondary)
+                Text("Sempre permitido").scaledFont(.caption).foregroundStyle(.secondary)
             case .denied:
-                Text(isPlan ? "Plano recusado" : "Negado").font(.caption).foregroundStyle(.secondary)
+                Text(isPlan ? "Plano recusado" : "Negado").scaledFont(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(12)
@@ -719,12 +1005,12 @@ private struct AgentRow: View {
                 Image(systemName: "person.crop.circle.badge.checkmark").foregroundStyle(accent)
                 Text("Subagente").fontWeight(.semibold)
                 Text(agent.type)
-                    .font(.caption2.weight(.semibold))
+                    .scaledFont(.caption2, weight: .semibold)
                     .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(Capsule().fill(accent.opacity(0.2)))
                 if agent.background {
                     Text("segundo plano")
-                        .font(.caption2.weight(.semibold))
+                        .scaledFont(.caption2, weight: .semibold)
                         .padding(.horizontal, 6).padding(.vertical, 2)
                         .background(Capsule().fill(Color.secondary.opacity(0.2)))
                 }
@@ -733,7 +1019,7 @@ private struct AgentRow: View {
                 if !agent.steps.isEmpty {
                     Button { showSteps.toggle() } label: {
                         Label("\(agent.steps.count) passos", systemImage: showSteps ? "chevron.up" : "chevron.down")
-                            .font(.caption)
+                            .scaledFont(.caption)
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
@@ -741,11 +1027,11 @@ private struct AgentRow: View {
             }
 
             if running && !agent.progress.isEmpty {
-                Text(agent.progress).font(.caption).foregroundStyle(.secondary)
+                Text(agent.progress).scaledFont(.caption).foregroundStyle(.secondary)
             }
 
             disclosure("Instruções", isOn: $showPrompt) {
-                Text(agent.prompt).font(.callout).fixedSize(horizontal: false, vertical: true)
+                Text(agent.prompt).scaledFont(.callout).fixedSize(horizontal: false, vertical: true)
             }
 
             if showSteps && !agent.steps.isEmpty {
@@ -754,7 +1040,7 @@ private struct AgentRow: View {
                         switch agent.steps[index] {
                         case .text(let text):
                             MarkdownText(text)
-                                .font(.callout)
+                                .scaledFont(.callout)
                                 .foregroundStyle(.secondary)
                         case .tool(let tool):
                             ToolRow(tool: tool)
@@ -794,7 +1080,7 @@ private struct AgentRow: View {
         VStack(alignment: .leading, spacing: 6) {
             Button { isOn.wrappedValue.toggle() } label: {
                 Label(title, systemImage: isOn.wrappedValue ? "chevron.down" : "chevron.right")
-                    .font(.caption.weight(.semibold))
+                    .scaledFont(.caption, weight: .semibold)
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
@@ -803,55 +1089,86 @@ private struct AgentRow: View {
     }
 }
 
-// MARK: - Conversation history
+// MARK: - Conversation sidebar
 
-struct HistoryList: View {
+struct ConversationSidebar: View {
     let directory: URL
-    let currentID: String?
-    let open: (String) -> Void
-    @State private var sessions: [SessionSummary]?
+    @ObservedObject var session: ChatSession
+    @State private var sessions: [SessionSummary] = []
+    @State private var search = ""
+    @State private var renaming: SessionSummary?
+    @State private var newTitle = ""
+    @State private var deleting: SessionSummary?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("Conversas nesta pasta").font(.headline).padding(12)
-            Divider()
-            if let sessions {
-                if sessions.isEmpty {
-                    Text("Nenhuma conversa salva ainda.")
-                        .foregroundStyle(.secondary).padding(20)
-                } else {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 0) {
-                            ForEach(sessions) { session in
-                                Button { open(session.id) } label: {
-                                    HStack(alignment: .top, spacing: 10) {
-                                        Image(systemName: session.id == currentID ? "bubble.left.fill" : "bubble.left")
-                                            .foregroundStyle(session.id == currentID ? accent : .secondary)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(session.title).lineLimit(2)
-                                            Text(session.date.formatted(.relative(presentation: .named)))
-                                                .font(.caption).foregroundStyle(.secondary)
-                                        }
-                                        Spacer(minLength: 0)
-                                    }
-                                    .padding(.horizontal, 12).padding(.vertical, 8)
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                Divider().padding(.leading, 38)
-                            }
+        List(selection: Binding(
+            get: { session.sessionID },
+            set: { id in if let id, id != session.sessionID { session.resume(id) } })) {
+            Section {
+                ForEach(filtered) { summary in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(summary.title).lineLimit(2)
+                        Text(summary.date.formatted(.relative(presentation: .named)))
+                            .scaledFont(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 2)
+                    .tag(summary.id)
+                    .contextMenu {
+                        Button("Renomear…") {
+                            newTitle = summary.title
+                            renaming = summary
                         }
+                        Button("Apagar…", role: .destructive) { deleting = summary }
                     }
                 }
-            } else {
-                ProgressView().frame(maxWidth: .infinity).padding(20)
+            } header: {
+                Text("Conversas")
             }
         }
-        .frame(width: 380, height: 440, alignment: .top)
-        .task {
-            let directory = directory
-            sessions = await Task.detached { Transcripts.list(for: directory) }.value
+        .listStyle(.sidebar)
+        .searchable(text: $search, placement: .sidebar, prompt: "Buscar conversas")
+        .safeAreaInset(edge: .top) {
+            Button { session.restart() } label: {
+                Label("Nova conversa", systemImage: "square.and.pencil").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .padding(.horizontal, 10).padding(.top, 6)
         }
+        .task(id: reloadKey) { await reload() }
+        .alert("Renomear conversa", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+            TextField("Nome", text: $newTitle)
+            Button("Salvar") {
+                if let renaming { CustomTitles.set(newTitle, for: renaming.id) }
+                renaming = nil
+                Task { await reload() }
+            }
+            Button("Cancelar", role: .cancel) { renaming = nil }
+        }
+        .confirmationDialog("Apagar esta conversa?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+                            presenting: deleting) { summary in
+            Button("Mover para o Lixo", role: .destructive) {
+                Transcripts.delete(summary.id, in: directory)
+                if summary.id == session.sessionID { session.restart() }
+                deleting = nil
+                Task { await reload() }
+            }
+        } message: { summary in
+            Text("“\(summary.title)” vai para o Lixo.")
+        }
+    }
+
+    private var filtered: [SessionSummary] {
+        let query = search.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return sessions }
+        return sessions.filter { $0.title.localizedCaseInsensitiveContains(query) }
+    }
+
+    // Reload when the conversation changes or a turn finishes (new titles and dates).
+    private var reloadKey: String { "\(directory.path)|\(session.sessionID ?? "")|\(session.busy)" }
+
+    private func reload() async {
+        let directory = directory
+        sessions = await Task.detached { Transcripts.list(for: directory, limit: 200) }.value
     }
 }
 
@@ -878,7 +1195,7 @@ private struct QuestionRow: View {
                     Button("Pular") { submit(nil) }
                 }
             } else if answers?.isEmpty == true {
-                Text("Pergunta ignorada").font(.caption).foregroundStyle(.secondary)
+                Text("Pergunta ignorada").scaledFont(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(12)
@@ -893,12 +1210,12 @@ private struct QuestionRow: View {
             HStack(spacing: 8) {
                 if !q.header.isEmpty {
                     Text(q.header.uppercased())
-                        .font(.caption2.weight(.semibold))
+                        .scaledFont(.caption2, weight: .semibold)
                         .padding(.horizontal, 6).padding(.vertical, 2)
                         .background(Capsule().fill(accent.opacity(0.2)))
                 }
                 if q.multiSelect && pending {
-                    Text("Escolha uma ou mais").font(.caption).foregroundStyle(.secondary)
+                    Text("Escolha uma ou mais").scaledFont(.caption).foregroundStyle(.secondary)
                 }
             }
             Text(q.question).fontWeight(.semibold).fixedSize(horizontal: false, vertical: true)
@@ -941,7 +1258,7 @@ private struct QuestionRow: View {
                     Text(option.label)
                     if !option.description.isEmpty {
                         Text(option.description)
-                            .font(.caption).foregroundStyle(.secondary)
+                            .scaledFont(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -981,16 +1298,30 @@ private struct MarkdownText: View {
         case quote(String)
         case rule
         case paragraph(String)
-        case code(String)
+        case code(String, language: String)
         case table(header: [String], alignments: [HorizontalAlignment], rows: [[String]])
     }
 
     let blocks: [Block]
+    @Environment(\.projectDirectory) private var directory
+
+    private final class Box { let blocks: [Block]; init(_ blocks: [Block]) { self.blocks = blocks } }
+    private static let cache = NSCache<NSString, Box>()
 
     init(_ source: String) {
+        if let cached = Self.cache.object(forKey: source as NSString) {
+            blocks = cached.blocks
+            return
+        }
+        blocks = Self.parse(source)
+        Self.cache.setObject(Box(blocks), forKey: source as NSString)
+    }
+
+    private static func parse(_ source: String) -> [Block] {
         var blocks: [Block] = []
         var paragraph: [String] = []
         var code: [String]?
+        var codeLanguage = ""
         var table: [String] = []
 
         func flushParagraph() {
@@ -1026,10 +1357,11 @@ private struct MarkdownText: View {
             flushTable()
             if trimmed.hasPrefix("```") {
                 if let lines = code {
-                    blocks.append(.code(lines.joined(separator: "\n")))
+                    blocks.append(.code(lines.joined(separator: "\n"), language: codeLanguage))
                     code = nil
                 } else {
                     flushParagraph()
+                    codeLanguage = String(trimmed.dropFirst(3)).trimmingCharacters(in: .whitespaces)
                     code = []
                 }
                 continue
@@ -1062,10 +1394,10 @@ private struct MarkdownText: View {
                 paragraph.append(trimmed)
             }
         }
-        if let lines = code { blocks.append(.code(lines.joined(separator: "\n"))) }
+        if let lines = code { blocks.append(.code(lines.joined(separator: "\n"), language: codeLanguage)) }
         flushTable()
         flushParagraph()
-        self.blocks = blocks
+        return blocks
     }
 
     var body: some View {
@@ -1081,8 +1413,8 @@ private struct MarkdownText: View {
     @ViewBuilder private func view(for block: Block) -> some View {
         switch block {
         case .heading(let level, let text):
-            Text(Self.attributed(text))
-                .font(level == 1 ? .title2.bold() : level == 2 ? .title3.bold() : .headline)
+            Text(attributed(text))
+                .scaledFont(level == 1 ? .title2 : level == 2 ? .title3 : .headline, weight: .bold)
                 .fixedSize(horizontal: false, vertical: true)
         case .listItem(let indent, let marker, let text):
             HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -1090,12 +1422,12 @@ private struct MarkdownText: View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
                     .frame(minWidth: 14, alignment: .trailing)
-                Text(Self.attributed(text))
+                Text(attributed(text))
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(.leading, CGFloat(indent) * 18)
         case .quote(let text):
-            Text(Self.attributed(text))
+            Text(attributed(text))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.leading, 10)
@@ -1105,12 +1437,12 @@ private struct MarkdownText: View {
         case .rule:
             Divider().frame(minWidth: 120)
         case .paragraph(let text):
-            Text(Self.attributed(text))
+            Text(attributed(text))
                 .fixedSize(horizontal: false, vertical: true)
-        case .code(let text):
+        case .code(let text, let language):
             ScrollView(.horizontal) {
-                Text(text)
-                    .font(.system(.callout, design: .monospaced))
+                Text(CodeHighlighter.highlight(text, language: language))
+                    .scaledFont(.callout, design: .monospaced)
                     .padding(10)
                     .padding(.trailing, 24)
             }
@@ -1145,7 +1477,7 @@ private struct MarkdownText: View {
     }
 
     private func tableCell(_ text: String, alignment: HorizontalAlignment) -> some View {
-        Text(Self.attributed(text))
+        Text(attributed(text))
             .multilineTextAlignment(alignment == .trailing ? .trailing : alignment == .center ? .center : .leading)
             .frame(maxWidth: 320, alignment: Alignment(horizontal: alignment, vertical: .center))
             .fixedSize(horizontal: false, vertical: true)
@@ -1181,8 +1513,37 @@ private struct MarkdownText: View {
         return false
     }
 
-    static func attributed(_ text: String) -> AttributedString {
+    private func attributed(_ text: String) -> AttributedString {
+        Self.attributed(text, linkingFilesIn: directory)
+    }
+
+    private final class AttributedBox { let value: AttributedString; init(_ value: AttributedString) { self.value = value } }
+    private static let attributedCache = NSCache<NSString, AttributedBox>()
+
+    /// Inline markdown, with `code spans` that name existing files turned into links.
+    static func attributed(_ text: String, linkingFilesIn directory: URL?) -> AttributedString {
+        let key = "\(directory?.path ?? "")\u{0}\(text)" as NSString
+        if let cached = attributedCache.object(forKey: key) { return cached.value }
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        var result = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        if let directory {
+            for run in result.runs where run.inlinePresentationIntent?.contains(.code) == true {
+                let span = String(result[run.range].characters)
+                if let url = fileURL(for: span, in: directory) {
+                    result[run.range].link = url
+                }
+            }
+        }
+        attributedCache.setObject(AttributedBox(result), forKey: key)
+        return result
+    }
+
+    private static func fileURL(for span: String, in directory: URL) -> URL? {
+        guard span.count < 300, !span.contains(" "), span.contains("/") || span.contains(".") else { return nil }
+        // Drop a trailing :line or :line:column.
+        let path = span.replacing(#/(:\d+)+$/#, with: "")
+        let expanded = (path as NSString).expandingTildeInPath
+        let url = expanded.hasPrefix("/") ? URL(fileURLWithPath: expanded) : directory.appendingPathComponent(expanded)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 }

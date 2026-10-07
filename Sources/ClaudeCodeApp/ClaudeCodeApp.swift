@@ -7,12 +7,100 @@ struct ClaudeCodeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup("Claude Code") {
-            ContentView()
-                .frame(minWidth: 640, minHeight: 420)
+        // Each window (or tab) holds one project folder and its own conversation.
+        WindowGroup("Claude Code", id: "main", for: URL.self) { $folder in
+            ContentView(directory: $folder)
+                .frame(minWidth: 720, minHeight: 460)
         }
-        .defaultSize(width: 960, height: 640)
+        .defaultSize(width: 1100, height: 720)
+        .commands { AppCommands() }
     }
+}
+
+// MARK: - Menus and shortcuts
+
+struct WindowActions {
+    var directory: URL?
+    var isChat: Bool
+    var newConversation: () -> Void
+    var openFolder: () -> Void
+    var exportConversation: () -> Void
+    var find: () -> Void
+    var showChanges: () -> Void
+}
+
+private struct WindowActionsKey: FocusedValueKey { typealias Value = WindowActions }
+
+extension FocusedValues {
+    var windowActions: WindowActions? {
+        get { self[WindowActionsKey.self] }
+        set { self[WindowActionsKey.self] = newValue }
+    }
+}
+
+struct AppCommands: Commands {
+    @FocusedValue(\.windowActions) private var actions
+    @Environment(\.openWindow) private var openWindow
+    @AppStorage("fontScale") private var fontScale = 1.0
+
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {
+            Button("Nova conversa") { actions?.newConversation() }
+                .keyboardShortcut("n")
+                .disabled(actions?.isChat != true)
+            Button("Nova aba") {
+                Tabbing.pendingParent = NSApp.keyWindow
+                if let directory = actions?.directory { openWindow(id: "main", value: directory) }
+                else { openWindow(id: "main") }
+            }
+            .keyboardShortcut("t")
+            Button("Nova janela") { openWindow(id: "main") }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+            Divider()
+            Button("Abrir pasta…") { actions?.openFolder() }
+                .keyboardShortcut("o")
+            Button("Exportar conversa…") { actions?.exportConversation() }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
+                .disabled(actions?.isChat != true)
+        }
+        CommandGroup(after: .textEditing) {
+            Button("Buscar na conversa") { actions?.find() }
+                .keyboardShortcut("f")
+                .disabled(actions?.isChat != true)
+        }
+        CommandGroup(after: .toolbar) {
+            Button("Aumentar texto") { fontScale = min(fontScale + 0.1, 2) }
+                .keyboardShortcut("+")
+            Button("Diminuir texto") { fontScale = max(fontScale - 0.1, 0.7) }
+                .keyboardShortcut("-")
+            Button("Tamanho padrão") { fontScale = 1 }
+                .keyboardShortcut("0")
+            Divider()
+            Button("Alterações do Git") { actions?.showChanges() }
+                .keyboardShortcut("g", modifiers: [.command, .shift])
+                .disabled(actions?.directory == nil)
+        }
+    }
+}
+
+/// Makes the next window that appears a tab of the window that asked for it.
+enum Tabbing {
+    static weak var pendingParent: NSWindow?
+}
+
+private struct WindowAccessor: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            guard let window = view.window, let parent = Tabbing.pendingParent, parent !== window else { return }
+            Tabbing.pendingParent = nil
+            parent.addTabbedWindow(window, ordered: .above)
+            window.makeKeyAndOrderFront(nil)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -185,89 +273,123 @@ struct TerminalHost: NSViewRepresentable {
 enum Mode: String { case chat, terminal }
 
 struct ContentView: View {
+    @Binding var directory: URL?
     @StateObject private var session = TerminalSession()
     @StateObject private var chat = ChatSession()
-    @State private var directory: URL?
     @AppStorage("mode") private var mode: Mode = .chat
-    @State private var showHistory = false
+    @State private var columns = NavigationSplitViewVisibility.all
+    @State private var findVisible = false
+    @State private var showChanges = false
 
     var body: some View {
-        Group {
-            if directory == nil {
-                WelcomeView(open: open, choose: chooseFolder)
-            } else if mode == .chat {
-                ChatView(session: chat)
-                    .overlay(alignment: .bottom) {
-                        if !chat.running { endedBanner(restart: reconnectChat).padding(.bottom, 90) }
+        main
+            .navigationTitle(directory?.lastPathComponent ?? "Claude Code")
+            .navigationSubtitle(directory?.path.replacingOccurrences(of: NSHomeDirectory(), with: "~") ?? "")
+            .toolbar { toolbar }
+            .onAppear(perform: startCurrentIfNeeded)
+            .onChange(of: mode) { _ in startCurrentIfNeeded() }
+            .onChange(of: directory) { _ in startCurrentIfNeeded() }
+            .onChange(of: chat.historyRequests) { _ in columns = .all }
+            .sheet(item: $chat.terminalCommand, onDismiss: chat.reconnect) { request in
+                if let directory {
+                    CommandTerminalSheet(command: request.command, directory: directory) {
+                        chat.terminalCommand = nil
                     }
-            } else if let view = session.terminalView {
-                TerminalHost(view: view)
-                    .id(ObjectIdentifier(view))
-                    .padding(6)
-                    .background(Color(nsColor: .textBackgroundColor))
-                    .overlay(alignment: .bottom) {
-                        if !session.running { endedBanner(restart: session.restart) }
-                    }
-            }
-        }
-        .navigationTitle(directory?.lastPathComponent ?? "Claude Code")
-        .navigationSubtitle(directory?.path ?? "")
-        .toolbar {
-            if directory != nil {
-                ToolbarItem(placement: .principal) {
-                    Picker("Modo", selection: $mode) {
-                        Label("Chat", systemImage: "bubble.left.and.bubble.right").tag(Mode.chat)
-                        Label("Terminal", systemImage: "terminal").tag(Mode.terminal)
-                    }
-                    .pickerStyle(.segmented)
-                    .help("Alternar entre chat e terminal")
-                }
-                ToolbarItemGroup {
-                    if mode == .chat, let directory {
-                        Button { showHistory.toggle() } label: {
-                            Label("Conversas", systemImage: "clock.arrow.circlepath")
-                        }
-                        .help("Retomar uma conversa anterior")
-                        .popover(isPresented: $showHistory, arrowEdge: .bottom) {
-                            HistoryList(directory: directory, currentID: chat.sessionID) { id in
-                                showHistory = false
-                                chat.resume(id)
-                            }
-                        }
-                    }
-                    Button(action: chooseFolder) {
-                        Label("Abrir pasta", systemImage: "folder")
-                    }
-                    .help("Abrir outra pasta")
-                    Button(action: restartCurrent) {
-                        Label(mode == .chat ? "Nova conversa" : "Reiniciar",
-                              systemImage: mode == .chat ? "square.and.pencil" : "arrow.clockwise")
-                    }
-                    .help(mode == .chat ? "Começar uma nova conversa" : "Reiniciar o Claude Code")
                 }
             }
+            .sheet(isPresented: $showChanges) {
+                if let directory { GitChangesView(directory: directory) }
+            }
+            .focusedSceneValue(\.windowActions, actions)
+            .background(WindowAccessor())
+            .onDisappear {
+                session.stop()
+                chat.stop()
+            }
+    }
+
+    @ViewBuilder private var main: some View {
+        if let directory {
+            if mode == .chat {
+                NavigationSplitView(columnVisibility: $columns) {
+                    ConversationSidebar(directory: directory, session: chat)
+                        .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 360)
+                } detail: {
+                    chatDetail
+                }
+            } else {
+                terminalDetail
+            }
+        } else {
+            WelcomeView(open: open, choose: chooseFolder)
         }
-        .onChange(of: mode) { _ in startCurrentIfNeeded() }
-        .onChange(of: chat.historyRequests) { _ in showHistory = true }
-        .sheet(item: $chat.terminalCommand, onDismiss: chat.reconnect) { request in
-            if let directory {
-                CommandTerminalSheet(command: request.command, directory: directory) {
-                    chat.terminalCommand = nil
+    }
+
+    private var chatDetail: some View {
+        ChatView(session: chat, findVisible: $findVisible)
+            .overlay(alignment: .bottom) {
+                if !chat.running && !chat.loadingHistory {
+                    endedBanner(restart: chat.reconnect).padding(.bottom, 90)
                 }
             }
+    }
+
+    @ViewBuilder private var terminalDetail: some View {
+        if let view = session.terminalView {
+            TerminalHost(view: view)
+                .id(ObjectIdentifier(view))
+                .padding(6)
+                .background(Color(nsColor: .textBackgroundColor))
+                .overlay(alignment: .bottom) {
+                    if !session.running { endedBanner(restart: session.restart) }
+                }
         }
-        .onDisappear {
-            session.stop()
-            chat.stop()
+    }
+
+    @ToolbarContentBuilder private var toolbar: some ToolbarContent {
+        if directory != nil {
+            ToolbarItem(placement: .principal) {
+                Picker("Modo", selection: $mode) {
+                    Label("Chat", systemImage: "bubble.left.and.bubble.right").tag(Mode.chat)
+                    Label("Terminal", systemImage: "terminal").tag(Mode.terminal)
+                }
+                .pickerStyle(.segmented)
+                .help("Alternar entre chat e terminal")
+            }
+            ToolbarItemGroup {
+                Button { showChanges = true } label: {
+                    Label("Alterações", systemImage: "plusminus.circle")
+                }
+                .help("Arquivos alterados no projeto (⇧⌘G)")
+                Button(action: chooseFolder) {
+                    Label("Abrir pasta", systemImage: "folder")
+                }
+                .help("Abrir outra pasta (⌘O)")
+                Button(action: restartCurrent) {
+                    Label(mode == .chat ? "Nova conversa" : "Reiniciar",
+                          systemImage: mode == .chat ? "square.and.pencil" : "arrow.clockwise")
+                }
+                .help(mode == .chat ? "Começar uma nova conversa (⌘N)" : "Reiniciar o Claude Code")
+            }
         }
+    }
+
+    private var actions: WindowActions {
+        WindowActions(
+            directory: directory,
+            isChat: directory != nil && mode == .chat,
+            newConversation: { chat.restart() },
+            openFolder: chooseFolder,
+            exportConversation: exportConversation,
+            find: { findVisible = true },
+            showChanges: { if directory != nil { showChanges = true } })
     }
 
     private func open(_ url: URL) {
         Recents.add(url)
-        directory = url
         session.stop()
         chat.stop()
-        startCurrentIfNeeded()
+        directory = url
     }
 
     // Each mode runs its own Claude Code process, started the first time it is shown.
@@ -281,13 +403,17 @@ struct ContentView: View {
         }
     }
 
-    // After the chat process exits, continue the same conversation when there is one.
-    private func reconnectChat() {
-        chat.reconnect()
-    }
-
     private func restartCurrent() {
         mode == .chat ? chat.restart() : session.restart()
+    }
+
+    private func exportConversation() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.init(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = "Conversa \(directory?.lastPathComponent ?? "Claude").md"
+        if panel.runModal() == .OK, let url = panel.url {
+            try? chat.exportMarkdown().write(to: url, atomically: true, encoding: .utf8)
+        }
     }
 
     private func endedBanner(restart: @escaping () -> Void) -> some View {

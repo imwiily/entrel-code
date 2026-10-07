@@ -30,11 +30,16 @@ struct ChatItem: Identifiable {
         var text: String
         var images: [NSImage] = []
         var files: [String] = []
+        /// Sent while Claude was still working; Claude Code folds it into the running turn.
+        var queued = false
+        /// Handled by the app (e.g. /model), so it isn't part of the saved transcript.
+        var local = false
     }
 
     struct Tool {
         var name: String
         var summary: String
+        var filePath: String?
         var detail: ToolDetail?
         var result: String?
         var isError = false
@@ -73,7 +78,28 @@ struct ChatItem: Identifiable {
     enum PermissionState { case pending, allowed, allowedAlways, denied }
 
     let id = UUID()
-    var kind: Kind
+    /// Bumped on every change so rows can skip re-rendering unchanged items.
+    private(set) var revision = 0
+    var kind: Kind { didSet { revision &+= 1 } }
+
+    init(kind: Kind) { self.kind = kind }
+
+    /// Plain text used by "find in conversation" and export.
+    var searchText: String {
+        switch kind {
+        case .user(let message): return message.text
+        case .assistant(let text): return text
+        case .tool(let tool): return "\(tool.name) \(tool.summary) \(tool.result ?? "")"
+        case .permission(let permission): return "\(permission.tool) \(permission.summary)"
+        case .question(let questions, let answers):
+            return questions.map(\.question).joined(separator: " ") + " " + (answers ?? [:]).values.joined(separator: " ")
+        case .agent(let agent):
+            return "\(agent.description) \(agent.result ?? "")"
+        case .choice(let choice): return choice.title
+        case .terminalHint(let command): return command
+        case .notice(let text): return text
+        }
+    }
 }
 
 struct ModelOption: Identifiable {
@@ -171,6 +197,9 @@ final class ChatSession: ObservableObject {
 
     /// Set when a command needs the interactive terminal; the UI shows it in a sheet.
     @Published var terminalCommand: TerminalCommand?
+    @Published private(set) var loadingHistory = false
+    /// Project files offered by @-mention completion, relative to the directory.
+    @Published private(set) var projectFiles: [String] = []
     /// Incremented to ask the UI to show the conversation history.
     @Published private(set) var historyRequests = 0
     private var terminalOnlyNames: Set<String> = Set(InteractiveCommands.terminal.map(\.name))
@@ -181,6 +210,12 @@ final class ChatSession: ObservableObject {
     private var buffer = Data()
     private var initRequestID = ""
     private var replaying = false
+    private var replaySubagents: [String: [[String: Any]]] = [:]
+    private var generation = 0
+    private var pendingSend: String?
+    // Streamed text is batched so the UI updates at most ~20 times a second.
+    private var pendingDelta = ""
+    private var deltaFlushScheduled = false
     private var turnStarted: Date?
 
     // Index of the assistant text item currently receiving streamed deltas.
@@ -213,9 +248,11 @@ final class ChatSession: ObservableObject {
         start(resuming: id)
     }
 
-    private func start(resuming resumeID: String?) {
+    private func start(resuming resumeID: String?, thenSend text: String? = nil) {
         guard let directory else { return }
         stop()
+        generation += 1
+        pendingDelta = ""
         items = []
         streamingIndex = nil
         streamedMessages = []
@@ -228,13 +265,31 @@ final class ChatSession: ObservableObject {
         contextTokens = 0
         costUSD = 0
         sessionID = resumeID
+        pendingSend = text
+        loadProjectFiles(in: directory)
 
-        if let resumeID {
-            replay(Transcripts.file(for: resumeID, in: directory))
+        guard let resumeID else {
+            launch(in: directory, resuming: nil)
+            return
         }
+        loadingHistory = true
+        let generation = generation
+        DispatchQueue.global(qos: .userInitiated).async {
+            let history = Transcripts.load(resumeID, in: directory)
+            DispatchQueue.main.async {
+                guard generation == self.generation else { return }
+                self.replay(history)
+                self.loadingHistory = false
+                self.launch(in: directory, resuming: resumeID)
+            }
+        }
+    }
 
+    private func launch(in directory: URL, resuming resumeID: String?) {
         let home = NSHomeDirectory()
         var env = ProcessInfo.processInfo.environment
+        // Markers from a parent Claude Code session would change how the child behaves.
+        for key in env.keys where key == "CLAUDECODE" || key.hasPrefix("CLAUDE_CODE_") { env[key] = nil }
         env["PATH"] = "\(home)/.local/bin:\(home)/.claude/local:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         env["LANG"] = env["LANG"] ?? "en_US.UTF-8"
 
@@ -284,6 +339,10 @@ final class ChatSession: ObservableObject {
         running = true
         initRequestID = UUID().uuidString
         write(["type": "control_request", "request_id": initRequestID, "request": ["subtype": "initialize"]])
+        if let text = pendingSend {
+            pendingSend = nil
+            send(text)
+        }
     }
 
     /// Reconnects after the process exited or settings changed in the terminal,
@@ -328,11 +387,14 @@ final class ChatSession: ObservableObject {
         }
         let fullText = ([text] + fileLines).filter { !$0.isEmpty }.joined(separator: "\n")
 
+        message.queued = busy
         append(.user(message))
         streamingIndex = nil
-        busy = true
-        activity = "Pensando…"
-        turnStarted = Date()
+        if !busy {
+            busy = true
+            activity = "Pensando…"
+            turnStarted = Date()
+        }
 
         let content: Any
         if blocks.isEmpty {
@@ -361,19 +423,19 @@ final class ChatSession: ObservableObject {
             return true
         case "model":
             if args.isEmpty {
-                append(.user(.init(text: text)))
+                append(.user(.init(text: text, local: true)))
                 append(.choice(.init(
                     title: "Escolha o modelo",
                     options: models.map { .init(label: $0.displayName, detail: $0.description, value: $0.value) },
                     action: .model, selected: nil)))
             } else {
-                append(.user(.init(text: text)))
+                append(.user(.init(text: text, local: true)))
                 setModel(args)
                 append(.notice("Modelo alterado para \(args)."))
             }
             return true
         case "effort" where args.isEmpty:
-            append(.user(.init(text: text)))
+            append(.user(.init(text: text, local: true)))
             let levels = [("low", "Baixo", "Respostas mais rápidas"), ("medium", "Médio", "Equilíbrio"),
                           ("high", "Alto", "Pensa mais"), ("xhigh", "Muito alto", "Para tarefas difíceis"),
                           ("max", "Máximo", "Esforço máximo"), ("auto", "Automático", "O modelo decide")]
@@ -393,8 +455,72 @@ final class ChatSession: ObservableObject {
     }
 
     func openTerminal(_ command: String?) {
-        if let command { append(.user(.init(text: command))) }
+        if let command { append(.user(.init(text: command, local: true))) }
         terminalCommand = TerminalCommand(command: command ?? "")
+    }
+
+    /// Rewrites a sent message: the conversation continues from a copy of the transcript
+    /// that ends just before that message, and the new text is sent there. Files changed
+    /// after that point are not reverted.
+    func edit(_ itemID: UUID, newText: String) {
+        guard !busy, let directory, let index = items.firstIndex(where: { $0.id == itemID }) else { return }
+        // Only messages that start a turn are prompts in the transcript.
+        if case .user(let message) = items[index].kind, message.queued || message.local { return }
+        let promptNumber = items[...index].filter {
+            if case .user(let message) = $0.kind { return !message.local && !message.queued }
+            return false
+        }.count
+        guard promptNumber > 0 else { return }
+        if promptNumber == 1 || sessionID == nil {
+            start(resuming: nil, thenSend: newText)
+            return
+        }
+        guard let sessionID, let fork = Transcripts.fork(sessionID, in: directory, beforePrompt: promptNumber) else {
+            append(.notice("Não foi possível editar: o histórico desta conversa não foi encontrado."))
+            return
+        }
+        start(resuming: fork, thenSend: newText)
+    }
+
+    func exportMarkdown() -> String {
+        var lines = ["# Conversa — \(directory?.lastPathComponent ?? "Claude Code")", ""]
+        for item in items {
+            switch item.kind {
+            case .user(let message):
+                lines += ["## Você", "", message.text]
+                lines += message.files.map { "- 📎 \($0)" }
+                if !message.images.isEmpty { lines.append("_(\(message.images.count) imagem(ns))_") }
+            case .assistant(let text):
+                lines += ["## Claude", "", text]
+            case .tool(let tool):
+                lines.append("> 🔧 **\(tool.name)** `\(tool.summary)`\(tool.isError ? " — erro" : "")")
+            case .agent(let agent):
+                lines.append("> 🤖 **Subagente** (\(agent.type)): \(agent.description)")
+                if let result = agent.result, !result.isEmpty {
+                    lines += [">"] + result.components(separatedBy: "\n").map { "> \($0)" }
+                }
+            case .permission(let permission):
+                lines.append("> ✋ Permissão para \(permission.tool): \(permission.state)")
+            case .question(let questions, let answers):
+                for question in questions {
+                    lines.append("> ❓ \(question.question) → \(answers?[question.question] ?? "sem resposta")")
+                }
+            case .choice, .terminalHint, .notice:
+                continue
+            }
+            lines.append("")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func loadProjectFiles(in directory: URL) {
+        let generation = generation
+        DispatchQueue.global(qos: .utility).async {
+            let files = ProjectFiles.list(in: directory)
+            DispatchQueue.main.async {
+                if generation == self.generation { self.projectFiles = files }
+            }
+        }
     }
 
     func choose(_ itemID: UUID, value: String) {
@@ -495,18 +621,18 @@ final class ChatSession: ObservableObject {
         }
     }
 
-    private func replay(_ file: URL) {
-        guard let data = try? Data(contentsOf: file) else {
+    private func replay(_ history: Transcripts.History) {
+        guard let events = history.events else {
             append(.notice("Não foi possível ler o histórico desta conversa."))
             return
         }
         replaying = true
-        defer { replaying = false }
-        for line in data.split(separator: 0x0A) {
-            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-                  object["isSidechain"] as? Bool != true, object["isMeta"] as? Bool != true else { continue }
-            handle(object)
+        replaySubagents = history.subagents
+        defer {
+            replaying = false
+            replaySubagents = [:]
         }
+        for event in events { handle(event) }
         // Background work from an earlier run can't report back any more.
         for (id, _) in agentIndex {
             updateAgent(id) { if $0.result == nil { $0.result = "" } }
@@ -535,6 +661,13 @@ final class ChatSession: ObservableObject {
             handleControlResponse(event["response"] as? [String: Any] ?? [:])
         case "result":
             handleResult(event)
+        case "attachment":
+            // Messages sent mid-turn are saved as queued_command attachments.
+            if replaying, let attachment = event["attachment"] as? [String: Any],
+               attachment["type"] as? String == "queued_command",
+               let prompt = attachment["prompt"] as? String, let shown = Self.userText(fromTranscript: prompt) {
+                append(.user(.init(text: shown, queued: true)))
+            }
         default:
             break
         }
@@ -624,6 +757,7 @@ final class ChatSession: ObservableObject {
                 if busy { activity = "Executando \(name)…" }
                 toolIndex[id] = append(.tool(.init(
                     name: name, summary: Self.summary(name: name, input: input),
+                    filePath: input["file_path"] as? String ?? input["notebook_path"] as? String,
                     detail: ToolDetail.make(name: name, input: input, fileMayHaveChanged: replaying))))
             default:
                 break
@@ -664,6 +798,9 @@ final class ChatSession: ObservableObject {
             guard let id = block["tool_use_id"] as? String else { continue }
             let isError = block["is_error"] as? Bool ?? false
             if agentIndex[id] != nil {
+                if replaying, let agentID = (toolUseResult as? [String: Any])?["agentId"] as? String {
+                    for step in replaySubagents[agentID] ?? [] { handleSubagent(step, parent: id) }
+                }
                 updateAgent(id) { agent in
                     if agent.background && !self.replaying {
                         agent.progress = "Rodando em segundo plano…"
@@ -685,6 +822,7 @@ final class ChatSession: ObservableObject {
     }
 
     private func handleResult(_ event: [String: Any]) {
+        flushDelta()
         busy = false
         activity = ""
         streamingIndex = nil
@@ -727,6 +865,7 @@ final class ChatSession: ObservableObject {
                     agent.steps.append(.tool(.init(
                         name: Self.isAgentTool(name) ? "Subagente" : name,
                         summary: Self.summary(name: name, input: input),
+                        filePath: input["file_path"] as? String ?? input["notebook_path"] as? String,
                         detail: ToolDetail.make(name: name, input: input, fileMayHaveChanged: replaying))))
                 default:
                     break
@@ -777,10 +916,13 @@ final class ChatSession: ObservableObject {
                 if let currentMessageID { streamedMessages.insert(currentMessageID) }
                 streamingIndex = append(.assistant(""))
             }
-            if let index = streamingIndex, case .assistant(let current) = items[index].kind {
-                items[index].kind = .assistant(current + text)
+            pendingDelta += text
+            if !deltaFlushScheduled {
+                deltaFlushScheduled = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.flushDelta() }
             }
         case "content_block_stop":
+            flushDelta()
             streamingIndex = nil
         default:
             break
@@ -841,8 +983,18 @@ final class ChatSession: ObservableObject {
         commands = byName.values.sorted { $0.name < $1.name }
     }
 
+    private func flushDelta() {
+        deltaFlushScheduled = false
+        guard !pendingDelta.isEmpty else { return }
+        if let index = streamingIndex, index < items.count, case .assistant(let current) = items[index].kind {
+            items[index].kind = .assistant(current + pendingDelta)
+        }
+        pendingDelta = ""
+    }
+
     @discardableResult
     private func append(_ kind: ChatItem.Kind) -> Int {
+        flushDelta()
         items.append(ChatItem(kind: kind))
         return items.count - 1
     }

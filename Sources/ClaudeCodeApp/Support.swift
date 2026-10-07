@@ -192,6 +192,85 @@ enum Transcripts {
         folder(for: directory).appendingPathComponent("\(sessionID).jsonl")
     }
 
+    struct History {
+        var events: [[String: Any]]?
+        /// Subagent transcripts by agent id, from <session>/subagents/agent-<id>.jsonl.
+        var subagents: [String: [[String: Any]]] = [:]
+    }
+
+    static func load(_ sessionID: String, in directory: URL) -> History {
+        guard let data = try? Data(contentsOf: file(for: sessionID, in: directory)) else { return History() }
+        var history = History(events: parse(data, skipSidechains: true))
+        let agentsFolder = folder(for: directory).appendingPathComponent("\(sessionID)/subagents")
+        let files = (try? FileManager.default.contentsOfDirectory(at: agentsFolder, includingPropertiesForKeys: nil)) ?? []
+        for file in files where file.pathExtension == "jsonl" && file.lastPathComponent.hasPrefix("agent-") {
+            let agentID = String(file.deletingPathExtension().lastPathComponent.dropFirst("agent-".count))
+            if let data = try? Data(contentsOf: file) { history.subagents[agentID] = parse(data, skipSidechains: false) }
+        }
+        return history
+    }
+
+    private static func parse(_ data: Data, skipSidechains: Bool) -> [[String: Any]] {
+        data.split(separator: 0x0A).compactMap { line in
+            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  object["isMeta"] as? Bool != true,
+                  !(skipSidechains && object["isSidechain"] as? Bool == true) else { return nil }
+            return object
+        }
+    }
+
+    /// Whether a transcript entry is something the person typed (as the chat shows it).
+    static func isPrompt(_ object: [String: Any]) -> Bool {
+        guard object["type"] as? String == "user", object["isMeta"] as? Bool != true,
+              object["isSidechain"] as? Bool != true else { return false }
+        let content = (object["message"] as? [String: Any])?["content"]
+        if let text = content as? String { return ChatSession.userText(fromTranscript: text) != nil }
+        let blocks = content as? [[String: Any]] ?? []
+        if blocks.contains(where: { $0["type"] as? String == "tool_result" }) { return false }
+        return blocks.contains {
+            $0["type"] as? String == "image"
+                || ($0["type"] as? String == "text" && ChatSession.userText(fromTranscript: $0["text"] as? String ?? "") != nil)
+        }
+    }
+
+    /// Copies the transcript up to (not including) its n-th prompt into a new session,
+    /// and returns the new session id.
+    static func fork(_ sessionID: String, in directory: URL, beforePrompt number: Int) -> String? {
+        guard let data = try? Data(contentsOf: file(for: sessionID, in: directory)) else { return nil }
+        let newID = UUID().uuidString.lowercased()
+        var output: [Data] = []
+        var prompts = 0
+        for line in data.split(separator: 0x0A) {
+            guard var object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            if isPrompt(object) {
+                prompts += 1
+                if prompts == number { break }
+            }
+            // Pointers to the latest message would reference what we're dropping.
+            if object["type"] as? String == "last-prompt" { continue }
+            if object["sessionId"] != nil { object["sessionId"] = newID }
+            if let encoded = try? JSONSerialization.data(withJSONObject: object) { output.append(encoded) }
+        }
+        guard prompts >= number else { return nil }
+        var joined = Data(output.joined(separator: [0x0A]))
+        joined.append(0x0A)
+        do {
+            try joined.write(to: file(for: newID, in: directory))
+        } catch {
+            return nil
+        }
+        return newID
+    }
+
+    /// Moves a conversation's transcript and its folder to the Trash.
+    static func delete(_ sessionID: String, in directory: URL) {
+        let base = folder(for: directory)
+        for url in [base.appendingPathComponent("\(sessionID).jsonl"), base.appendingPathComponent(sessionID)] {
+            try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        }
+        CustomTitles.set(nil, for: sessionID)
+    }
+
     static func list(for directory: URL, limit: Int = 50) -> [SessionSummary] {
         let folder = folder(for: directory)
         let files = (try? FileManager.default.contentsOfDirectory(
@@ -202,8 +281,9 @@ enum Transcripts {
             .sorted { $0.1 > $1.1 }
             .prefix(limit)
         return dated.compactMap { url, date in
+            let id = url.deletingPathExtension().lastPathComponent
             guard let title = title(of: url) else { return nil }
-            return SessionSummary(id: url.deletingPathExtension().lastPathComponent, title: title, date: date)
+            return SessionSummary(id: id, title: CustomTitles.get(id) ?? title, date: date)
         }
     }
 
@@ -223,8 +303,7 @@ enum Transcripts {
                     if let value = object[key] as? String, !value.isEmpty { title = value }
                 }
             }
-            if isUser, object["type"] as? String == "user", object["isMeta"] as? Bool != true,
-               object["isSidechain"] as? Bool != true {
+            if isUser, isPrompt(object) {
                 let content = (object["message"] as? [String: Any])?["content"]
                 let text = (content as? String)
                     ?? (content as? [[String: Any]])?.compactMap { $0["text"] as? String }.first
@@ -235,6 +314,127 @@ enum Transcripts {
         }
         guard let result = title ?? firstPrompt else { return nil }
         return String(result.replacingOccurrences(of: "\n", with: " ").prefix(120))
+    }
+}
+
+/// Names given to conversations in the sidebar, kept by the app.
+enum CustomTitles {
+    private static let key = "conversationTitles"
+
+    static func get(_ id: String) -> String? {
+        (UserDefaults.standard.dictionary(forKey: key) as? [String: String])?[id]
+    }
+
+    static func set(_ title: String?, for id: String) {
+        var titles = UserDefaults.standard.dictionary(forKey: key) as? [String: String] ?? [:]
+        titles[id] = title?.isEmpty == false ? title : nil
+        UserDefaults.standard.set(titles, forKey: key)
+    }
+}
+
+// MARK: - Project files
+
+enum ProjectFiles {
+    private static let skipped: Set<String> = [".git", "node_modules", ".build", "build", "DerivedData", "Pods",
+                                               ".next", "dist", "target", ".venv", "venv", "__pycache__"]
+
+    /// Files for @-mentions: what git tracks (plus untracked, minus ignored) when the
+    /// folder is in a repository, otherwise a filesystem walk that skips build output.
+    static func list(in directory: URL, limit: Int = 20_000) -> [String] {
+        if let output = Shell.run("git", ["ls-files", "--cached", "--others", "--exclude-standard"], in: directory),
+           !output.isEmpty {
+            return Array(output.split(separator: "\n").prefix(limit).map(String.init))
+        }
+        var files: [String] = []
+        let base = directory.standardizedFileURL.path
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return [] }
+        for case let url as URL in enumerator {
+            if skipped.contains(url.lastPathComponent) { enumerator.skipDescendants(); continue }
+            if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { continue }
+            files.append(String(url.standardizedFileURL.path.dropFirst(base.count + 1)))
+            if files.count >= limit { break }
+        }
+        return files
+    }
+}
+
+enum Shell {
+    /// Runs a command and returns its stdout, or nil when it fails.
+    static func run(_ command: String, _ arguments: [String], in directory: URL) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [command] + arguments
+        process.currentDirectoryURL = directory
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = Pipe()
+        do { try process.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
+// MARK: - Git changes
+
+struct GitChange: Identifiable, Hashable {
+    let status: String
+    let path: String
+    var id: String { path }
+
+    var label: String {
+        switch status.trimmingCharacters(in: .whitespaces) {
+        case "??": return "Novo"
+        case let s where s.contains("D"): return "Apagado"
+        case let s where s.contains("A"): return "Adicionado"
+        case let s where s.contains("R"): return "Renomeado"
+        default: return "Modificado"
+        }
+    }
+}
+
+enum Git {
+    /// Changed files under the directory, with paths relative to it; nil outside a repository.
+    static func changes(in directory: URL) -> [GitChange]? {
+        guard let output = Shell.run("git", ["-c", "status.relativePaths=true", "status", "--short", "-uall", "--", "."],
+                                     in: directory) else { return nil }
+        return output.split(separator: "\n").compactMap { line in
+            guard line.count > 3 else { return nil }
+            var path = String(line.dropFirst(3))
+            if let arrow = path.range(of: " -> ") { path = String(path[arrow.upperBound...]) }
+            return GitChange(status: String(line.prefix(2)), path: path.trimmingCharacters(in: CharacterSet(charactersIn: "\"")))
+        }
+    }
+
+    static func diff(for change: GitChange, in directory: URL) -> [DiffLine] {
+        let url = directory.appendingPathComponent(change.path)
+        if change.status.contains("?") {
+            let text = (try? String(contentsOf: url, encoding: .utf8)) ?? "(arquivo binário)"
+            return text.components(separatedBy: "\n").prefix(2000).map { DiffLine(kind: .added, text: $0) }
+        }
+        let output = Shell.run("git", ["diff", "HEAD", "--", change.path], in: directory)
+            ?? Shell.run("git", ["diff", "--cached", "--", change.path], in: directory) ?? ""
+        return parseUnified(output)
+    }
+
+    static func parseUnified(_ diff: String) -> [DiffLine] {
+        var lines: [DiffLine] = []
+        for line in diff.components(separatedBy: "\n") {
+            if line.hasPrefix("diff --git") || line.hasPrefix("index ") || line.hasPrefix("--- ")
+                || line.hasPrefix("+++ ") || line.hasPrefix("new file") || line.hasPrefix("deleted file") { continue }
+            if line.hasPrefix("@@") {
+                lines.append(DiffLine(kind: .gap, text: line))
+            } else if line.hasPrefix("+") {
+                lines.append(DiffLine(kind: .added, text: String(line.dropFirst())))
+            } else if line.hasPrefix("-") {
+                lines.append(DiffLine(kind: .removed, text: String(line.dropFirst())))
+            } else if line.hasPrefix(" ") {
+                lines.append(DiffLine(kind: .context, text: String(line.dropFirst())))
+            }
+        }
+        return lines
     }
 }
 
