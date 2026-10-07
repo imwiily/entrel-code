@@ -11,7 +11,19 @@ struct ChatItem: Identifiable {
         case permission(Permission)
         case question([Question], answers: [String: String]?)
         case agent(Agent)
+        case choice(Choice)
+        case terminalHint(command: String)
         case notice(String)
+    }
+
+    /// A native picker for commands that are interactive in the terminal, like /model.
+    struct Choice {
+        enum Action { case model, command(String) }
+        struct Option { let label: String; let detail: String; let value: String }
+        let title: String
+        let options: [Option]
+        let action: Action
+        var selected: String?
     }
 
     struct UserMessage {
@@ -75,7 +87,54 @@ struct SlashCommand: Identifiable {
     let name: String
     let description: String
     let argumentHint: String
+    var opensTerminal = false
     var id: String { name }
+}
+
+struct TerminalCommand: Identifiable {
+    let id = UUID()
+    let command: String
+}
+
+enum InteractiveCommands {
+    /// Commands that only work in the interactive terminal UI. Those marked `whenBare`
+    /// also have a usable non-interactive form when given arguments (e.g. /config key=value).
+    static let terminal: [(name: String, description: String, whenBare: Bool)] = [
+        ("login", "Entrar na sua conta", false),
+        ("logout", "Sair da sua conta", false),
+        ("status", "Versão, conta, modelo e diagnóstico", false),
+        ("config", "Abrir as configurações", true),
+        ("permissions", "Gerenciar regras de permissão", false),
+        ("memory", "Editar a memória (CLAUDE.md)", false),
+        ("mcp", "Gerenciar servidores MCP", true),
+        ("hooks", "Gerenciar hooks", false),
+        ("theme", "Mudar o tema do terminal", false),
+        ("doctor", "Verificar a instalação", false),
+        ("ide", "Conectar a uma IDE", false),
+        ("plugin", "Gerenciar plugins", false),
+        ("add-dir", "Adicionar um diretório de trabalho", false),
+        ("export", "Exportar a conversa", false),
+        ("release-notes", "Ver as novidades", false),
+        ("feedback", "Enviar feedback", false),
+        ("bug", "Relatar um problema", false),
+        ("privacy-settings", "Configurações de privacidade", false),
+        ("statusline", "Configurar a linha de status", false),
+        ("terminal-setup", "Configurar o terminal", false),
+        ("install-github-app", "Instalar o app do GitHub", false),
+        ("upgrade", "Fazer upgrade do plano", false),
+        ("vim", "Alternar modo vim", false),
+        ("color", "Mudar a cor da sessão", false),
+        ("focus", "Modo foco", false),
+    ]
+
+    /// Commands the app handles itself.
+    static let native: [SlashCommand] = [
+        SlashCommand(name: "clear", description: "Começar uma nova conversa", argumentHint: ""),
+        SlashCommand(name: "resume", description: "Retomar uma conversa anterior", argumentHint: ""),
+        SlashCommand(name: "model", description: "Escolher o modelo", argumentHint: "[modelo]"),
+        SlashCommand(name: "effort", description: "Escolher o nível de esforço", argumentHint: "[nível]"),
+        SlashCommand(name: "terminal", description: "Abrir o Claude Code interativo aqui", argumentHint: "[comando]"),
+    ]
 }
 
 struct PermissionModeOption: Identifiable {
@@ -109,6 +168,13 @@ final class ChatSession: ObservableObject {
     @Published private(set) var contextTokens = 0
     @Published private(set) var contextWindow = 200_000
     @Published private(set) var costUSD = 0.0
+
+    /// Set when a command needs the interactive terminal; the UI shows it in a sheet.
+    @Published var terminalCommand: TerminalCommand?
+    /// Incremented to ask the UI to show the conversation history.
+    @Published private(set) var historyRequests = 0
+    private var terminalOnlyNames: Set<String> = Set(InteractiveCommands.terminal.map(\.name))
+    private var lastSlashCommand: String?
 
     private var process: Process?
     private var stdin: FileHandle?
@@ -220,6 +286,14 @@ final class ChatSession: ObservableObject {
         write(["type": "control_request", "request_id": initRequestID, "request": ["subtype": "initialize"]])
     }
 
+    /// Reconnects after the process exited or settings changed in the terminal,
+    /// continuing the current conversation when it has one.
+    func reconnect() {
+        guard !busy else { return }
+        let hasConversation = items.contains { if case .user = $0.kind { return true }; return false }
+        if let sessionID, hasConversation { resume(sessionID) } else { restart() }
+    }
+
     func stop() {
         if let process, process.isRunning { process.terminate() }
         process = nil
@@ -233,7 +307,9 @@ final class ChatSession: ObservableObject {
 
     func send(_ text: String, attachments: [Attachment] = []) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if attachments.isEmpty, text.hasPrefix("/"), handleCommand(text) { return }
         guard (!text.isEmpty || !attachments.isEmpty), running else { return }
+        lastSlashCommand = text.hasPrefix("/") ? text : nil
 
         var message = ChatItem.UserMessage(text: text)
         var blocks: [[String: Any]] = []
@@ -266,6 +342,72 @@ final class ChatSession: ObservableObject {
             content = blocks
         }
         write(["type": "user", "message": ["role": "user", "content": content]])
+    }
+
+    /// Handles slash commands that are interactive in the terminal. Returns false
+    /// for commands that should go to Claude Code as usual.
+    private func handleCommand(_ text: String) -> Bool {
+        let parts = text.dropFirst().split(separator: " ", maxSplits: 1)
+        guard let first = parts.first else { return false }
+        let name = String(first)
+        let args = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
+
+        switch name {
+        case "clear", "new", "reset":
+            restart()
+            return true
+        case "resume", "continue":
+            historyRequests += 1
+            return true
+        case "model":
+            if args.isEmpty {
+                append(.user(.init(text: text)))
+                append(.choice(.init(
+                    title: "Escolha o modelo",
+                    options: models.map { .init(label: $0.displayName, detail: $0.description, value: $0.value) },
+                    action: .model, selected: nil)))
+            } else {
+                append(.user(.init(text: text)))
+                setModel(args)
+                append(.notice("Modelo alterado para \(args)."))
+            }
+            return true
+        case "effort" where args.isEmpty:
+            append(.user(.init(text: text)))
+            let levels = [("low", "Baixo", "Respostas mais rápidas"), ("medium", "Médio", "Equilíbrio"),
+                          ("high", "Alto", "Pensa mais"), ("xhigh", "Muito alto", "Para tarefas difíceis"),
+                          ("max", "Máximo", "Esforço máximo"), ("auto", "Automático", "O modelo decide")]
+            append(.choice(.init(title: "Escolha o nível de esforço",
+                                 options: levels.map { .init(label: $0.1, detail: $0.2, value: $0.0) },
+                                 action: .command("/effort"), selected: nil)))
+            return true
+        case "terminal":
+            openTerminal(args.isEmpty ? nil : args)
+            return true
+        default:
+            let bareOnly = InteractiveCommands.terminal.first { $0.name == name }?.whenBare ?? false
+            guard terminalOnlyNames.contains(name), !(bareOnly && !args.isEmpty) else { return false }
+            openTerminal(text)
+            return true
+        }
+    }
+
+    func openTerminal(_ command: String?) {
+        if let command { append(.user(.init(text: command))) }
+        terminalCommand = TerminalCommand(command: command ?? "")
+    }
+
+    func choose(_ itemID: UUID, value: String) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }),
+              case .choice(var choice) = items[index].kind, choice.selected == nil else { return }
+        choice.selected = value
+        items[index].kind = .choice(choice)
+        switch choice.action {
+        case .model:
+            setModel(value)
+        case .command(let command):
+            send("\(command) \(value)")
+        }
     }
 
     func interrupt() {
@@ -402,6 +544,9 @@ final class ChatSession: ObservableObject {
         switch event["subtype"] as? String {
         case "init":
             resolvedModel = event["model"] as? String ?? resolvedModel
+            if let names = event["terminal_slash_commands"] as? [String] {
+                terminalOnlyNames.formUnion(names)
+            }
             sessionID = event["session_id"] as? String ?? sessionID
             if let mode = event["permissionMode"] as? String, mode != permissionMode {
                 permissionMode = mode
@@ -454,7 +599,14 @@ final class ChatSession: ObservableObject {
                 // Live text arrives as stream deltas; replayed and local-command text doesn't.
                 guard !streamed, let text = block["text"] as? String else { continue }
                 let cleaned = Self.stripCommandTags(text)
-                if !cleaned.isEmpty { append(.assistant(cleaned)) }
+                if !replaying, let command = lastSlashCommand, cleaned.contains("isn't available in this environment")
+                    || cleaned.contains("in the terminal for details") {
+                    if !cleaned.contains("isn't available") { append(.assistant(cleaned)) }
+                    append(.terminalHint(command: command))
+                    lastSlashCommand = nil
+                } else if !cleaned.isEmpty {
+                    append(.assistant(cleaned))
+                }
                 streamingIndex = nil
             case "tool_use":
                 let id = block["id"] as? String ?? UUID().uuidString
@@ -675,12 +827,18 @@ final class ChatSession: ObservableObject {
                         displayName: $0["displayName"] as? String ?? "",
                         description: $0["description"] as? String ?? "")
         }
-        commands = (payload["commands"] as? [[String: Any]] ?? []).compactMap {
-            guard let name = $0["name"] as? String, !name.hasPrefix("_") else { return nil }
-            return SlashCommand(name: name, description: $0["description"] as? String ?? "",
-                                argumentHint: $0["argumentHint"] as? String ?? "")
+        var byName: [String: SlashCommand] = [:]
+        for entry in payload["commands"] as? [[String: Any]] ?? [] {
+            guard let name = entry["name"] as? String, !name.hasPrefix("_") else { continue }
+            byName[name] = SlashCommand(name: name, description: entry["description"] as? String ?? "",
+                                        argumentHint: entry["argumentHint"] as? String ?? "")
         }
-        .sorted { $0.name < $1.name }
+        for command in InteractiveCommands.native { byName[command.name] = command }
+        for command in InteractiveCommands.terminal {
+            byName[command.name] = SlashCommand(name: command.name, description: command.description,
+                                                argumentHint: "", opensTerminal: true)
+        }
+        commands = byName.values.sorted { $0.name < $1.name }
     }
 
     @discardableResult

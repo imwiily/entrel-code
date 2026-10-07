@@ -50,6 +50,8 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
     @Published var directory: URL?
     @Published var running = false
     @Published var title = ""
+    /// Extra shell-quoted arguments for `claude`, e.g. a slash command to run on launch.
+    var arguments = ""
     @Published private(set) var terminalView: LocalProcessTerminalView?
 
     func open(_ url: URL) {
@@ -79,7 +81,7 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         view.startProcess(
             executable: shell,
-            args: ["-l", "-c", "exec claude"],
+            args: ["-l", "-c", arguments.isEmpty ? "exec claude" : "exec claude \(arguments)"],
             environment: env,
             execName: "-" + (shell as NSString).lastPathComponent,
             currentDirectory: directory.path
@@ -246,6 +248,14 @@ struct ContentView: View {
             }
         }
         .onChange(of: mode) { _ in startCurrentIfNeeded() }
+        .onChange(of: chat.historyRequests) { _ in showHistory = true }
+        .sheet(item: $chat.terminalCommand, onDismiss: chat.reconnect) { request in
+            if let directory {
+                CommandTerminalSheet(command: request.command, directory: directory) {
+                    chat.terminalCommand = nil
+                }
+            }
+        }
         .onDisappear {
             session.stop()
             chat.stop()
@@ -273,7 +283,7 @@ struct ContentView: View {
 
     // After the chat process exits, continue the same conversation when there is one.
     private func reconnectChat() {
-        if let id = chat.sessionID { chat.resume(id) } else { chat.restart() }
+        chat.reconnect()
     }
 
     private func restartCurrent() {
@@ -302,6 +312,48 @@ struct ContentView: View {
         if panel.runModal() == .OK, let url = panel.url {
             open(url)
         }
+    }
+}
+
+/// Runs an interactive Claude Code command (like /login or /config) in a terminal
+/// over the chat. Closing it reconnects the chat so new settings take effect.
+struct CommandTerminalSheet: View {
+    let command: String
+    let directory: URL
+    let close: () -> Void
+    @StateObject private var session = TerminalSession()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "terminal").foregroundStyle(.secondary)
+                Text(command.isEmpty ? "Claude Code interativo" : command)
+                    .font(.system(.body, design: .monospaced)).fontWeight(.semibold)
+                Text(session.running ? "Use o teclado no terminal; Esc volta nos menus."
+                                     : "O comando terminou.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Concluir", action: close)
+                    .keyboardShortcut("w", modifiers: .command)
+                    .help("Fechar e voltar ao chat (⌘W)")
+            }
+            .padding(10)
+            Divider()
+            if let view = session.terminalView {
+                TerminalHost(view: view)
+                    .id(ObjectIdentifier(view))
+                    .padding(6)
+                    .background(Color(nsColor: .textBackgroundColor))
+            } else {
+                Spacer()
+            }
+        }
+        .frame(minWidth: 820, minHeight: 520)
+        .onAppear {
+            session.arguments = command.isEmpty ? "" : ChatSession.shellQuote(command)
+            session.open(directory)
+        }
+        .onDisappear(perform: session.stop)
     }
 }
 

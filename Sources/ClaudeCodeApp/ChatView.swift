@@ -169,6 +169,13 @@ struct ChatView: View {
                         if !command.argumentHint.isEmpty {
                             Text(command.argumentHint).font(.caption).foregroundStyle(.tertiary)
                         }
+                        if command.opensTerminal {
+                            Label("terminal", systemImage: "terminal")
+                                .font(.caption2)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                                .help("Abre numa janela de terminal por cima do chat")
+                        }
                         Text(command.description)
                             .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         Spacer(minLength: 0)
@@ -409,12 +416,63 @@ private struct ChatRow: View {
             }
         case .agent(let agent):
             AgentRow(agent: agent)
+        case .choice(let choice):
+            ChoiceRow(choice: choice) { session.choose(item.id, value: $0) }
+        case .terminalHint(let command):
+            HStack(spacing: 10) {
+                Image(systemName: "terminal").foregroundStyle(accent)
+                Text("\(command) é interativo e precisa do terminal.")
+                Spacer()
+                Button("Abrir no terminal") { session.terminalCommand = TerminalCommand(command: command) }
+                    .buttonStyle(.borderedProminent).tint(accent)
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 10).fill(accent.opacity(0.08)))
         case .notice(let text):
             Label(text, systemImage: "exclamationmark.triangle")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
         }
+    }
+}
+
+private struct ChoiceRow: View {
+    let choice: ChatItem.Choice
+    let pick: (String) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(choice.title).fontWeight(.semibold)
+            if let selected = choice.selected {
+                Label(choice.options.first { $0.value == selected }?.label ?? selected,
+                      systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(accent)
+            } else {
+                ForEach(choice.options, id: \.value) { option in
+                    Button { pick(option.value) } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Image(systemName: "circle").foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(option.label)
+                                if !option.detail.isEmpty {
+                                    Text(option.detail).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(8)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.06)))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(accent.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(accent.opacity(choice.selected == nil ? 0.6 : 0.2)))
     }
 }
 
