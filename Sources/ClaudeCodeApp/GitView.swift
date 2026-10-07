@@ -13,17 +13,21 @@ struct GitChangesView: View {
         VStack(spacing: 0) {
             HStack {
                 Label("Alterações em \(directory.lastPathComponent)", systemImage: "plusminus.circle")
-                    .font(.headline)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.textPrimary)
                 Spacer()
                 Button { Task { await reload() } } label: { Image(systemName: "arrow.clockwise") }
                     .help("Atualizar")
                 Button("Fechar") { dismiss() }
+                    .buttonStyle(.elevated)
                     .keyboardShortcut(.cancelAction)
             }
             .padding(12)
-            Divider()
+            .background(Theme.surfaceLowest)
+            Rectangle().fill(Theme.divider).frame(height: 1)
             content
         }
+        .background(Theme.canvas)
         .frame(minWidth: 900, minHeight: 560)
         .task { await reload() }
         .onChange(of: selection) { change in
@@ -60,6 +64,8 @@ struct GitChangesView: View {
                             }
                         }
                     }
+                    .scrollContentBackground(.hidden)
+                    .background(Theme.surface)
                     .frame(minWidth: 260, idealWidth: 300)
 
                     diffView.frame(minWidth: 500)
@@ -88,15 +94,15 @@ struct GitChangesView: View {
                 .textSelection(.enabled)
                 .padding(.vertical, 6)
             }
-            .background(Color(nsColor: .textBackgroundColor))
+            .background(Theme.codeInset)
         }
     }
 
     private func color(for change: GitChange) -> Color {
         switch change.label {
-        case "Novo", "Adicionado": return .green
-        case "Apagado": return .red
-        default: return .orange
+        case "Novo", "Adicionado": return Theme.successText
+        case "Apagado": return Theme.errorText
+        default: return Theme.brand
         }
     }
 
@@ -118,17 +124,18 @@ private struct GitDiffLine: View {
         HStack(spacing: 0) {
             Text(line.kind == .added ? "+" : line.kind == .removed ? "−" : "")
                 .frame(width: 18)
-                .foregroundStyle(line.kind == .added ? Color.green : line.kind == .removed ? Color.red : .secondary)
+                .foregroundStyle(line.kind == .added ? Theme.success : line.kind == .removed ? Theme.error : Theme.textMuted)
             Text(line.text.isEmpty ? " " : line.text)
-                .foregroundStyle(line.kind == .gap ? Color.secondary : Color.primary)
+                .foregroundStyle(line.kind == .added ? Theme.successText : line.kind == .removed ? Theme.errorText
+                                 : line.kind == .gap ? Theme.textMuted : Theme.hex(0xA5A5A9))
                 .fixedSize()
             Spacer(minLength: 0)
         }
         .font(.system(.callout, design: .monospaced))
         .padding(.vertical, 1)
         .padding(.trailing, 12)
-        .background(line.kind == .added ? Color.green.opacity(0.14)
-                    : line.kind == .removed ? Color.red.opacity(0.14)
-                    : line.kind == .gap ? Color.secondary.opacity(0.08) : Color.clear)
+        .background(line.kind == .added ? Theme.addedBackground
+                    : line.kind == .removed ? Theme.removedBackground
+                    : line.kind == .gap ? Theme.surface : Color.clear)
     }
 }

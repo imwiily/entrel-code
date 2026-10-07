@@ -8,9 +8,11 @@ struct ClaudeCodeApp: App {
 
     var body: some Scene {
         // Each window (or tab) holds one project folder and its own conversation.
-        WindowGroup("Claude Code", id: "main", for: URL.self) { $folder in
+        WindowGroup("Entrel Code", id: "main", for: URL.self) { $folder in
             ContentView(directory: $folder)
                 .frame(minWidth: 720, minHeight: 460)
+                .preferredColorScheme(.dark)
+                .tint(Theme.brand)
         }
         .defaultSize(width: 1100, height: 720)
         .commands { AppCommands() }
@@ -106,30 +108,13 @@ private struct WindowAccessor: NSViewRepresentable {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        // Entrel Code is dark-only; this also covers menus, sheets and panels.
+        NSApp.appearance = NSAppearance(named: .darkAqua)
         NSApp.activate(ignoringOtherApps: true)
         Notifier.requestAuthorization()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-}
-
-// MARK: - Recent folders
-
-enum Recents {
-    private static let key = "recentFolders"
-
-    static var all: [URL] {
-        (UserDefaults.standard.stringArray(forKey: key) ?? [])
-            .map { URL(fileURLWithPath: $0) }
-            .filter { FileManager.default.fileExists(atPath: $0.path) }
-    }
-
-    static func add(_ url: URL) {
-        var paths = UserDefaults.standard.stringArray(forKey: key) ?? []
-        paths.removeAll { $0 == url.path }
-        paths.insert(url.path, at: 0)
-        UserDefaults.standard.set(Array(paths.prefix(8)), forKey: key)
-    }
 }
 
 // MARK: - Terminal session
@@ -155,6 +140,10 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         view.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         view.processDelegate = self
         view.optionAsMetaKey = true
+        view.nativeBackgroundColor = NSColor(srgbRed: 0x0D / 255, green: 0x0D / 255, blue: 0x0E / 255, alpha: 1)
+        view.nativeForegroundColor = NSColor(srgbRed: 0xEC / 255, green: 0xEC / 255, blue: 0xED / 255, alpha: 1)
+        view.caretColor = NSColor(srgbRed: 0xD9 / 255, green: 0x77 / 255, blue: 0x45 / 255, alpha: 1)
+        view.selectedTextBackgroundColor = NSColor(srgbRed: 0xD9 / 255, green: 0x77 / 255, blue: 0x45 / 255, alpha: 0.35)
         view.getTerminal().changeHistorySize(10_000)
         installScrollMonitor(for: view)
 
@@ -270,8 +259,6 @@ struct TerminalHost: NSViewRepresentable {
 
 // MARK: - Views
 
-enum Mode: String { case chat, terminal }
-
 struct ContentView: View {
     @Binding var directory: URL?
     @StateObject private var session = TerminalSession()
@@ -283,9 +270,12 @@ struct ContentView: View {
 
     var body: some View {
         main
-            .navigationTitle(directory?.lastPathComponent ?? "Claude Code")
+            .background(Theme.canvas)
+            .navigationTitle(directory?.lastPathComponent ?? "Entrel Code")
             .navigationSubtitle(directory?.path.replacingOccurrences(of: NSHomeDirectory(), with: "~") ?? "")
             .toolbar { toolbar }
+            .toolbarBackground(Theme.surfaceLowest, for: .windowToolbar)
+            .toolbarBackground(.visible, for: .windowToolbar)
             .onAppear(perform: startCurrentIfNeeded)
             .onChange(of: mode) { _ in startCurrentIfNeeded() }
             .onChange(of: directory) { _ in startCurrentIfNeeded() }
@@ -338,8 +328,8 @@ struct ContentView: View {
         if let view = session.terminalView {
             TerminalHost(view: view)
                 .id(ObjectIdentifier(view))
-                .padding(6)
-                .background(Color(nsColor: .textBackgroundColor))
+                .padding(8)
+                .background(Theme.canvas)
                 .overlay(alignment: .bottom) {
                     if !session.running { endedBanner(restart: session.restart) }
                 }
@@ -347,16 +337,20 @@ struct ContentView: View {
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            EntrelMark().frame(width: 18, height: 18).help("Entrel Code")
+        }
         if directory != nil {
             ToolbarItem(placement: .principal) {
+                AgentStatusPill(chat: chat, mode: mode)
+            }
+            ToolbarItemGroup {
                 Picker("Modo", selection: $mode) {
                     Label("Chat", systemImage: "bubble.left.and.bubble.right").tag(Mode.chat)
                     Label("Terminal", systemImage: "terminal").tag(Mode.terminal)
                 }
                 .pickerStyle(.segmented)
                 .help("Alternar entre chat e terminal")
-            }
-            ToolbarItemGroup {
                 Button { showChanges = true } label: {
                     Label("Alterações", systemImage: "plusminus.circle")
                 }
@@ -370,6 +364,10 @@ struct ContentView: View {
                           systemImage: mode == .chat ? "square.and.pencil" : "arrow.clockwise")
                 }
                 .help(mode == .chat ? "Começar uma nova conversa (⌘N)" : "Reiniciar o Claude Code")
+                Button { chat.openTerminal("/config") } label: {
+                    Label("Configurações", systemImage: "gearshape")
+                }
+                .help("Configurações do Claude Code")
             }
         }
     }
@@ -418,13 +416,16 @@ struct ContentView: View {
 
     private func endedBanner(restart: @escaping () -> Void) -> some View {
         HStack(spacing: 12) {
-            Text("O Claude Code foi encerrado.")
+            StatusBead(color: Theme.error)
+            Text("O Claude Code foi encerrado.").font(.system(size: 12)).foregroundStyle(Theme.textPrimary)
             Button("Reiniciar", action: restart)
+                .buttonStyle(.brand)
                 .keyboardShortcut(.defaultAction)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.regularMaterial, in: Capsule())
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .card(background: Theme.elevated, border: Theme.subtle, radius: 12)
+        .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
         .padding(.bottom, 20)
     }
 
@@ -452,28 +453,32 @@ struct CommandTerminalSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Image(systemName: "terminal").foregroundStyle(.secondary)
-                Text(command.isEmpty ? "Claude Code interativo" : command)
-                    .font(.system(.body, design: .monospaced)).fontWeight(.semibold)
+                Text("›").foregroundStyle(Theme.brand)
+                Text(command.isEmpty ? "claude" : command)
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Theme.textPrimary)
                 Text(session.running ? "Use o teclado no terminal; Esc volta nos menus."
                                      : "O comando terminou.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.system(size: 11)).foregroundStyle(Theme.textSecondary)
                 Spacer()
                 Button("Concluir", action: close)
+                    .buttonStyle(.brand)
                     .keyboardShortcut("w", modifiers: .command)
                     .help("Fechar e voltar ao chat (⌘W)")
             }
-            .padding(10)
-            Divider()
+            .padding(12)
+            .background(Theme.surfaceLowest)
+            Rectangle().fill(Theme.divider).frame(height: 1)
             if let view = session.terminalView {
                 TerminalHost(view: view)
                     .id(ObjectIdentifier(view))
-                    .padding(6)
-                    .background(Color(nsColor: .textBackgroundColor))
+                    .padding(8)
+                    .background(Theme.canvas)
             } else {
                 Spacer()
             }
         }
+        .background(Theme.canvas)
         .frame(minWidth: 820, minHeight: 520)
         .onAppear {
             session.arguments = command.isEmpty ? "" : ChatSession.shellQuote(command)
@@ -483,48 +488,3 @@ struct CommandTerminalSheet: View {
     }
 }
 
-struct WelcomeView: View {
-    let open: (URL) -> Void
-    let choose: () -> Void
-    private let recents = Recents.all
-
-    var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "sparkle")
-                .font(.system(size: 48))
-                .foregroundStyle(Color(red: 0.85, green: 0.47, blue: 0.34))
-            Text("Claude Code")
-                .font(.largeTitle.weight(.semibold))
-            Button(action: choose) {
-                Label("Abrir pasta…", systemImage: "folder")
-                    .frame(minWidth: 180)
-            }
-            .controlSize(.large)
-            .keyboardShortcut("o")
-
-            if !recents.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Recentes").font(.headline).foregroundStyle(.secondary)
-                    ForEach(recents, id: \.path) { url in
-                        Button { open(url) } label: {
-                            HStack {
-                                Image(systemName: "folder.fill").foregroundStyle(.secondary)
-                                VStack(alignment: .leading) {
-                                    Text(url.lastPathComponent)
-                                    Text(url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                                        .font(.caption).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .frame(maxWidth: 360)
-            }
-        }
-        .padding(40)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}

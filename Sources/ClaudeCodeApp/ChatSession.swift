@@ -640,6 +640,16 @@ final class ChatSession: ObservableObject {
         streamingIndex = nil
     }
 
+    #if DEBUG
+    /// Feeds protocol events as if replayed from a transcript, for offscreen render tests.
+    func injectForTesting(_ events: [[String: Any]], directory: URL? = nil) {
+        if let directory { self.directory = directory }
+        replaying = true
+        for event in events { handle(event) }
+        replaying = false
+    }
+    #endif
+
     private func handle(_ event: [String: Any]) {
         if let parent = event["parent_tool_use_id"] as? String {
             handleSubagent(event, parent: parent)

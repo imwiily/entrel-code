@@ -41,17 +41,17 @@ enum CodeHighlighter {
             var color: Color?
             var bold = false
             if match.range(withName: "comment").location != NSNotFound {
-                color = Color(nsColor: .secondaryLabelColor)
+                color = Theme.textMuted
             } else if match.range(withName: "string").location != NSNotFound {
-                color = Color(nsColor: .systemRed)
+                color = Theme.hex(0x9CC9A6)
             } else if match.range(withName: "number").location != NSNotFound {
-                color = Color(nsColor: .systemBlue)
+                color = Theme.hex(0xD7B370)
             } else if match.range(withName: "word").location != NSNotFound {
                 let word = ns.substring(with: match.range)
                 if common.contains(word) {
-                    color = Color(nsColor: .systemPink); bold = true
+                    color = Theme.hex(0xE58E66); bold = true
                 } else if word.first?.isUppercase == true {
-                    color = Color(nsColor: .systemTeal)
+                    color = Theme.hex(0x8DB6C7)
                 }
             }
             guard let color, let range = Range(match.range, in: code),

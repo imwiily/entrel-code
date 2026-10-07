@@ -1,9 +1,9 @@
 #!/bin/zsh
-# Builds "Claude Code.app" and installs it into ~/Applications.
+# Builds "Entrel Code.app" and installs it into ~/Applications.
 set -euo pipefail
 cd "${0:a:h}"
 
-APP_NAME="Claude Code"
+APP_NAME="Entrel Code"
 APP="build/$APP_NAME.app"
 DEST="$HOME/Applications"
 
@@ -49,5 +49,7 @@ codesign --force --deep --sign - "$APP"
 
 mkdir -p "$DEST"
 rm -rf "$DEST/$APP_NAME.app"
+# The app used to be installed as "Claude Code.app"; remove that copy.
+rm -rf "$DEST/Claude Code.app"
 cp -R "$APP" "$DEST/"
 echo "Instalado em $DEST/$APP_NAME.app"

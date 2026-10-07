@@ -26,6 +26,10 @@ struct ComposerTextView: NSViewRepresentable {
         textView.allowsUndo = true
         textView.font = .systemFont(ofSize: fontSize)
         textView.drawsBackground = false
+        textView.insertionPointColor = NSColor(srgbRed: 0xD9 / 255, green: 0x77 / 255, blue: 0x45 / 255, alpha: 1)
+        textView.textColor = NSColor(srgbRed: 0xEC / 255, green: 0xEC / 255, blue: 0xED / 255, alpha: 1)
+        textView.selectedTextAttributes = [.backgroundColor: NSColor(srgbRed: 0xD9 / 255, green: 0x77 / 255,
+                                                                    blue: 0x45 / 255, alpha: 0.35)]
         textView.textContainerInset = NSSize(width: 0, height: 2)
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
