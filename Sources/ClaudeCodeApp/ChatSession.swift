@@ -174,7 +174,12 @@ struct PermissionModeOption: Identifiable {
         PermissionModeOption(value: "acceptEdits", title: "Aceitar edições", symbol: "pencil.and.outline"),
         PermissionModeOption(value: "plan", title: "Modo plano", symbol: "list.bullet.clipboard"),
         PermissionModeOption(value: "auto", title: "Automático", symbol: "bolt"),
+        PermissionModeOption(value: bypass, title: "Ignorar permissões", symbol: "exclamationmark.shield"),
     ]
+
+    /// Runs every tool without asking. Only offered after a confirmation, and never saved
+    /// as the default, so each new session starts asking again.
+    static let bypass = "bypassPermissions"
 }
 
 final class ChatSession: ObservableObject {
@@ -188,7 +193,8 @@ final class ChatSession: ObservableObject {
     @Published private(set) var models: [ModelOption] = []
     @Published private(set) var commands: [SlashCommand] = []
     @Published private(set) var selectedModel = UserDefaults.standard.string(forKey: "chatModel") ?? "default"
-    @Published private(set) var permissionMode = UserDefaults.standard.string(forKey: "permissionMode") ?? "default"
+    @Published private(set) var permissionMode = UserDefaults.standard.string(forKey: "permissionMode")
+        .flatMap { $0 == PermissionModeOption.bypass ? nil : $0 } ?? "default"
     @Published private(set) var resolvedModel = ""
 
     @Published private(set) var contextTokens = 0
@@ -266,6 +272,10 @@ final class ChatSession: ObservableObject {
         costUSD = 0
         sessionID = resumeID
         pendingSend = text
+        // "Ignorar permissões" never carries over into a new conversation.
+        if resumeID == nil, permissionMode == PermissionModeOption.bypass {
+            permissionMode = UserDefaults.standard.string(forKey: "permissionMode") ?? "default"
+        }
         loadProjectFiles(in: directory)
 
         guard let resumeID else {
@@ -294,6 +304,8 @@ final class ChatSession: ObservableObject {
         env["LANG"] = env["LANG"] ?? "en_US.UTF-8"
 
         var command = "exec claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio"
+        // Lets the person switch to "Ignorar permissões" mid-session; on its own it changes nothing.
+        command += " --allow-dangerously-skip-permissions"
         command += " --permission-mode \(Self.shellQuote(permissionMode))"
         if selectedModel != "default" { command += " --model \(Self.shellQuote(selectedModel))" }
         if let resumeID { command += " --resume \(Self.shellQuote(resumeID))" }
@@ -549,7 +561,7 @@ final class ChatSession: ObservableObject {
 
     func setPermissionMode(_ value: String) {
         permissionMode = value
-        UserDefaults.standard.set(value, forKey: "permissionMode")
+        if value != PermissionModeOption.bypass { UserDefaults.standard.set(value, forKey: "permissionMode") }
         if running { sendControl(["subtype": "set_permission_mode", "mode": value]) }
     }
 

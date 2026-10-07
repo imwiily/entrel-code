@@ -516,6 +516,9 @@ struct ChatView: View {
 
 private struct StatusBar: View {
     @ObservedObject var session: ChatSession
+    @State private var confirmBypass = false
+
+    private var bypassing: Bool { session.permissionMode == PermissionModeOption.bypass }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -538,8 +541,13 @@ private struct StatusBar: View {
 
             Menu {
                 ForEach(PermissionModeOption.all) { mode in
+                    if mode.value == PermissionModeOption.bypass { Divider() }
                     Button {
-                        session.setPermissionMode(mode.value)
+                        if mode.value == PermissionModeOption.bypass && !bypassing {
+                            confirmBypass = true
+                        } else {
+                            session.setPermissionMode(mode.value)
+                        }
                     } label: {
                         if mode.value == session.permissionMode {
                             Label(mode.title, systemImage: "checkmark")
@@ -549,9 +557,18 @@ private struct StatusBar: View {
                     }
                 }
             } label: {
-                Label(currentMode.title, systemImage: currentMode.symbol)
+                Label(currentMode.title, systemImage: bypassing ? "exclamationmark.shield.fill" : currentMode.symbol)
             }
-            .help("Modo de permissão")
+            .tint(bypassing ? Theme.errorText : Theme.textMuted)
+            .help(bypassing ? "O Claude está executando tudo sem pedir permissão" : "Modo de permissão")
+            .alert("Ignorar todas as permissões?", isPresented: $confirmBypass) {
+                Button("Ignorar permissões", role: .destructive) {
+                    session.setPermissionMode(PermissionModeOption.bypass)
+                }
+                Button("Cancelar", role: .cancel) {}
+            } message: {
+                Text("O Claude vai executar qualquer comando e alterar ou apagar arquivos sem pedir confirmação. Use só em projetos em que você confia. Vale só para esta sessão; ao abrir uma nova conversa, volta a perguntar.")
+            }
 
             Spacer()
 
